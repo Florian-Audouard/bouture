@@ -85,3 +85,69 @@ async def test_character_reads_published_world(backend: str) -> None:
             )
             assert [tuple(r) for r in rows] == [(1, "Aldéra"), (2, "Aldéra")]
         await engine.dispose()
+
+
+async def test_character_site() -> None:
+    from examples.character_site.app import build_agents as build_site
+    from examples.character_site.app import create_app as create_site
+
+    app = create_site(build_site())
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://t") as c,
+    ):
+        r = await c.get("/")
+        assert r.status_code == 200 and "Atelier de personnages" in r.text
+        assert (await c.get("/info")).json() == {"model": "demo"}
+        sid = (await c.post("/agents/sessions", json={"kind": "character"}, headers=H)).json()["id"]
+        for msg in ["nom: Lyra", "âge: 27 ans", "aime: la pluie", "compétence: crochetage"]:
+            r = await c.post(f"/agents/sessions/{sid}/messages", json={"content": msg}, headers=H)
+            assert parse_sse(r.text)[-1]["data"]["reason"] == "completed"
+        state = (await c.get(f"/agents/sessions/{sid}/state", headers=H)).json()["state"]
+        assert (state["name"], state["age"]) == ("Lyra", "27 ans")
+        assert state["likes"] == ["la pluie"] and state["skills"] == ["crochetage"]
+
+        # Valeur trop longue : refusée dès les arguments (maxLength du schéma), état intact.
+        msg = "âge: " + "très " * 30
+        r = await c.post(f"/agents/sessions/{sid}/messages", json={"content": msg}, headers=H)
+        result = next(e["data"] for e in parse_sse(r.text) if e["type"] == "tool_result")
+        assert result["is_error"] and "arguments invalides" in result["content"]
+        state = (await c.get(f"/agents/sessions/{sid}/state", headers=H)).json()["state"]
+        assert state["age"] == "27 ans"
+
+        # Question posée par l'outil « ask » : choix proposés, réponse libre acceptée.
+        msg = "question: Elfe ou humaine ? | elfe | humaine"
+        r = await c.post(f"/agents/sessions/{sid}/messages", json={"content": msg}, headers=H)
+        ask = next(e["data"] for e in parse_sse(r.text) if e["type"] == "ask_user")
+        assert (ask["tool_name"], ask["choices"]) == ("ask", ["elfe", "humaine"])
+        r = await c.post(
+            f"/agents/sessions/{sid}/answer",
+            json={"answer": "demi-elfe", "tool_call_id": ask["tool_call_id"]},
+            headers=H,
+        )
+        result = next(e["data"] for e in parse_sse(r.text) if e["type"] == "tool_result")
+        assert result["content"] == "demi-elfe"
+
+
+def test_client_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from examples.character_world.demo_model import DemoModelClient
+    from examples.llm import OPENROUTER, client_from_env
+
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    client, model = client_from_env()
+    assert isinstance(client, DemoModelClient) and model == "demo"
+
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    with pytest.raises(RuntimeError):
+        client_from_env()
+
+    pytest.importorskip("litellm")
+    from bouture.models.litellm import LiteLLMClient
+
+    monkeypatch.setenv("LLM_MODEL", "vendor/some-model")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    client, model = client_from_env()
+    assert isinstance(client, LiteLLMClient) and model == "openai/vendor/some-model"
+    assert client.extra == {"api_base": OPENROUTER, "api_key": "sk-test"}

@@ -189,8 +189,31 @@ Le personnage reçoit un monde publié en input, l'outil `read_world` en lit la 
 uv run uvicorn examples.character_world.app:app --reload
 ```
 
-`DATABASE_URL` active Postgres (sinon mémoire) ; `BOUTURE_MODEL` active LiteLLM. L'utilisateur
-courant est lu dans l'en-tête `X-User`, à remplacer par votre authentification.
+[examples/character_site](examples/character_site) : un site de démonstration (une page, sans
+build) pour créer un personnage en discutant avec l'agent. La fiche (nom, âge, genre, apparence,
+personnalité, histoire, manies, goûts, aversions, compétences) se met à jour en direct. L'agent
+pose ses questions avec l'outil `ask` (choix proposés ou réponse libre), et une question en attente
+reste affichée après un rechargement. Les réponses de l'agent sont rendues en Markdown, et la page
+permet aussi l'édition manuelle et la publication.
+
+```bash
+uv run uvicorn examples.character_site.app:app --reload
+```
+
+Les deux exemples tournent sans clé avec un modèle de démonstration (commandes `nom: …`,
+`trait: …`). Pour un vrai LLM compatible OpenAI (OpenRouter par défaut), créez un fichier `.env` à
+la racine. Il est ignoré par git et ne doit jamais être commité.
+
+```dotenv
+LLM_API_KEY=sk-or-...                       # https://openrouter.ai/keys
+LLM_MODEL=anthropic/claude-sonnet-4.5       # un modèle qui gère les appels d'outils
+# LLM_BASE_URL=https://openrouter.ai/api/v1  # défaut ; tout autre endpoint compatible OpenAI
+# DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/db
+```
+
+Les variables déjà présentes dans l'environnement priment sur le `.env` (voir
+[examples/llm.py](examples/llm.py)). `DATABASE_URL` active Postgres, sinon le stockage est en mémoire.
+L'utilisateur courant est lu dans l'en-tête `X-User`, à remplacer par votre authentification.
 
 ## Tests
 

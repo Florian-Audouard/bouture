@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "character-site",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "uvicorn", "examples.character_site.app:app", "--port", "8765"],
+      "port": 8765
+    }
+  ]
+}

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
+from pydantic import Field
 
 from bouture import (
+    AgentDefinition,
     Agents,
     FakeModelClient,
     FakeReply,
@@ -13,6 +15,7 @@ from bouture import (
     NotAwaitingInput,
     NotFound,
     SessionBusy,
+    ToolContext,
 )
 
 from .conftest import AgentsFactory, Note, collect, types
@@ -341,3 +344,16 @@ async def test_ask_with_invalid_state_is_not_asked(
     assert tr.data["is_error"] and "invalide" in tr.data["content"]
     assert evs[-1].data["reason"] == "completed"
     assert (await agents.get_state(s.id, OWNER)).state.score == 0
+
+
+def test_tool_schema_keeps_annotated_description() -> None:
+    d = AgentDefinition[None, None]("schema", model="m")
+
+    @d.tool
+    async def pick(
+        ctx: ToolContext[None, None], n: Annotated[int, Field(description="Combien")] = 1
+    ) -> str:
+        """Choisit."""
+        return str(n)
+
+    assert pick.spec().parameters["properties"]["n"]["description"] == "Combien"

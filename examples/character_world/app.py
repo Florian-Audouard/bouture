@@ -2,9 +2,10 @@
 
     uv run uvicorn examples.character_world.app:app --reload
 
-Variables d'environnement :
-- ``DATABASE_URL`` (ex. ``postgresql+asyncpg://user:pw@localhost/db``) ; absent → stockage mémoire ;
-- ``BOUTURE_MODEL`` (ex. ``anthropic/claude-sonnet-5-5``, via LiteLLM) ; absent → modèle de démo.
+Configuration (environnement ou ``.env`` à la racine) :
+- ``LLM_API_KEY``, ``LLM_MODEL``, ``LLM_BASE_URL`` : LLM compatible OpenAI (voir ``examples/llm.py``) ;
+  sans clé → modèle de démo ;
+- ``DATABASE_URL`` (ex. ``postgresql+asyncpg://user:pw@localhost/db``) ; absent → stockage mémoire.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from sqlalchemy import text
 from bouture import Agents, MemoryStorage, ModelClient
 from bouture.fastapi import make_router
 
+from ..llm import client_from_env, load_env
 from .definitions import AppDeps, register
 from .demo_model import DemoModelClient
 
@@ -35,15 +37,11 @@ CREATE TABLE IF NOT EXISTS app_worlds (
 """
 
 
-def build_agents(database_url: str | None = None, model: str | None = None) -> Agents[AppDeps]:
+def build_agents(
+    database_url: str | None = None, client: ModelClient | None = None, model: str = "demo"
+) -> Agents[AppDeps]:
     deps = AppDeps()
-    client: ModelClient
-    if model:
-        from bouture.models.litellm import LiteLLMClient
-
-        client = LiteLLMClient()
-    else:
-        client = DemoModelClient()
+    client = client or DemoModelClient()
     if database_url:
         from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -52,7 +50,7 @@ def build_agents(database_url: str | None = None, model: str | None = None) -> A
     else:
         agents = Agents[AppDeps](storage=MemoryStorage(), deps=deps, model_client=client)
     deps.agents = agents
-    register(agents, model or "demo")
+    register(agents, model)
     return agents
 
 
@@ -81,4 +79,5 @@ def create_app(agents: Agents[AppDeps]) -> FastAPI:
     return app
 
 
-app = create_app(build_agents(os.environ.get("DATABASE_URL"), os.environ.get("BOUTURE_MODEL")))
+load_env()
+app = create_app(build_agents(os.environ.get("DATABASE_URL"), *client_from_env()))

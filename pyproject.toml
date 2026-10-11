@@ -25,6 +25,8 @@ dev = [
     "fastapi>=0.110",
     "asyncpg>=0.29",
     "uvicorn>=0.30",
+    "litellm>=1.60",
+    "python-dotenv>=1.0",
 ]
 
 [build-system]

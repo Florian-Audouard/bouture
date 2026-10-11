@@ -66,7 +66,7 @@ def _params_model(fn: ToolFn, name: str) -> type[BaseModel]:
     sig = inspect.signature(fn)
     params = list(sig.parameters.values())[1:]  # le premier paramètre est le contexte
     try:
-        hints = typing.get_type_hints(fn)
+        hints = typing.get_type_hints(fn, include_extras=True)
     except Exception:
         hints = {}
     fields: dict[str, Any] = {}

@@ -328,9 +328,11 @@ dev = [
     { name = "asyncpg" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "litellm" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "python-dotenv" },
     { name = "ruff" },
     { name = "uvicorn" },
 ]
@@ -351,9 +353,11 @@ dev = [
     { name = "asyncpg", specifier = ">=0.29" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "litellm", specifier = ">=1.60" },
     { name = "pyright", specifier = ">=1.1.380" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "python-dotenv", specifier = ">=1.0" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
