@@ -7,16 +7,19 @@ import contextlib
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
-from .context import PurgeContext, ResolveContext, TurnEndContext
+from . import jsonpatch
+from .context import InitContext, PurgeContext, ResolveContext, TurnEndContext
 from .definition import AgentDefinition
 from .errors import (
+    InvalidSettings,
     InvalidTarget,
     NotAwaitingInput,
     NotFound,
@@ -26,7 +29,17 @@ from .errors import (
 )
 from .events import Hub, now, to_event
 from .ids import uuid7
-from .models.base import ModelClient
+from .importing import ImportedEntry, ImportedPublication
+from .messages import (
+    AssistantMessage,
+    ImageBlock,
+    ReasoningBlock,
+    TextBlock,
+    ToolCallBlock,
+    UserMessage,
+    normalize_content,
+)
+from .models.base import Estimate, ModelClient, ModelRequest
 from .refs import Data, PublishedRef, Ref
 from .runner import InProcessRunner, TurnRunner
 from .state import Migration, StateCodec, migrate
@@ -42,13 +55,22 @@ from .storage.base import (
     TurnRecord,
 )
 from .tree import Tree
-from .turn import CANCELLED_QUESTION, Builder, TurnExecutor, recover_crashed, tool_result_content
+from .turn import (
+    CANCELLED_QUESTION,
+    Builder,
+    TurnExecutor,
+    build_request,
+    recover_crashed,
+    tool_result_content,
+)
 from .views import (
     EntryView,
     Event,
+    InputView,
     Page,
     PendingQuestion,
     PublicationInfo,
+    RequestPreview,
     SessionInfo,
     Siblings,
     StateView,
@@ -61,6 +83,61 @@ log = logging.getLogger("bouture")
 
 Resolver = Callable[[Ref | Data, ResolveContext[Any]], Awaitable[str]]
 PurgeHook = Callable[[PurgeContext[Any], str, list[UUID]], Awaitable[None]]
+
+
+def _message_content(role: str, content: Any) -> dict[str, Any]:
+    """Contenu stocké d'un message posé sans appel LLM (texte ou blocs)."""
+    try:
+        blocks = normalize_content(content)
+    except ValidationError as e:
+        raise InvalidTarget(f"contenu de message invalide : {e}") from e
+    if role == "user":
+        return UserMessage(content=blocks).model_dump(mode="json")
+    if role == "assistant":
+        if any(isinstance(b, ImageBlock) for b in blocks):
+            raise InvalidTarget("un message assistant ne contient que du texte")
+        texts = [TextBlock(text=b.text) for b in blocks if isinstance(b, TextBlock)]
+        return AssistantMessage(content=list(texts)).model_dump(mode="json")
+    raise InvalidTarget(f"rôle de message inconnu : {role}")
+
+
+def _edited_content(target: EntryRecord, content: Any) -> dict[str, Any]:
+    """Nouveau contenu d'un message édité ; côté assistant, seul le texte est remplacé (D97)."""
+    if target.type == "user":
+        return _message_content("user", content)
+    new = AssistantMessage.model_validate(_message_content("assistant", content))
+    old = AssistantMessage.model_validate(target.content)
+    reasoning = [b for b in old.content if isinstance(b, ReasoningBlock)]
+    calls = [b for b in old.content if isinstance(b, ToolCallBlock)]
+    return AssistantMessage(
+        content=[*reasoning, *new.content, *calls], interrupted=old.interrupted
+    ).model_dump(mode="json")
+
+
+def _cancel_pending(b: Builder, pending: list[dict[str, Any]]) -> None:
+    for q in pending:
+        b.add(
+            "tool_result",
+            tool_result_content(q["tool_call_id"], q["tool_name"], CANCELLED_QUESTION, False),
+        )
+
+
+def _input_content(r: InputRecord) -> dict[str, Any]:
+    return {
+        "mode": r.mode,
+        "kind": r.kind,
+        "object_id": str(r.object_id) if r.object_id else None,
+        "version": r.version,
+        "data": r.data,
+        "data_version": r.data_version,
+    }
+
+
+def _input_view(inp: Ref | Data) -> InputView:
+    if isinstance(inp, Ref):
+        return InputView(mode="ref", kind=inp.kind, id=inp.id, version=inp.version)
+    value = inp.value.model_dump(mode="json") if isinstance(inp.value, BaseModel) else inp.value
+    return InputView(mode="data", kind=inp.kind, value=value)
 
 
 class _DataType:
@@ -246,6 +323,7 @@ class Agents[D]:
             title=s.title,
             metadata=s.metadata,
             model=s.model_override or (self._defs[s.kind].model if s.kind in self._defs else ""),
+            model_settings=s.model_settings,
             status=status,
             leaf_entry_id=s.leaf_entry_id,
             pending=[PendingQuestion.model_validate(p) for p in s.pending],
@@ -265,6 +343,93 @@ class Agents[D]:
             return None
         rec = (await tx.get_states([entry.state_id]))[entry.state_id]
         return codec.load(rec.data, rec.state_version)
+
+    async def _entry(self, tx: StorageTx, session_id: UUID, entry_id: UUID) -> EntryRecord:
+        e = await tx.get_entry(entry_id)
+        if e is None or e.session_id != session_id:
+            raise NotFound(f"entrée {entry_id} introuvable")
+        return e
+
+    @staticmethod
+    def _check_settings(
+        d: AgentDefinition[Any, Any], settings: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        bad = sorted(set(settings) - d.overridable_settings)
+        if bad:
+            raise InvalidSettings(f"réglages non surchargeables pour {d.kind} : {bad}")
+        return {k: v for k, v in settings.items() if v is not None}
+
+    @staticmethod
+    def _effective_input_records(
+        recs: list[InputRecord], path: Sequence[EntryRecord]
+    ) -> list[InputRecord]:
+        """Inputs de la création, recouverts par les ``input_update`` du chemin (D99)."""
+        by_name = {r.name: r for r in recs}
+        for e in path:
+            if e.type != "input_update":
+                continue
+            for name, c in e.content["inputs"].items():
+                by_name[name] = InputRecord(
+                    e.session_id,
+                    name,
+                    c["mode"],
+                    c["kind"],
+                    UUID(c["object_id"]) if c.get("object_id") else None,
+                    c.get("version"),
+                    c.get("data"),
+                    c.get("data_version"),
+                )
+        return list(by_name.values())
+
+    async def _pin_inputs(
+        self,
+        tx: StorageTx,
+        session_id: UUID,
+        d: AgentDefinition[Any, Any],
+        inputs: Mapping[str, Ref | Data],
+    ) -> tuple[list[InputRecord], dict[str, Ref | Data]]:
+        """Valide les inputs et fige les ``Ref`` sans version sur la dernière publiée (D54)."""
+        sid = session_id
+        records: list[InputRecord] = []
+        pinned: dict[str, Ref | Data] = {}
+        for name, inp in sorted(inputs.items()):
+            if inp.kind != d.inputs[name]:
+                raise ResolveError(f"input {name} : kind {d.inputs[name]} attendu, {inp.kind} reçu")
+            if isinstance(inp, Ref):
+                pubs = await tx.get_publications(inp.id)
+                if not pubs or pubs[0].kind != inp.kind:
+                    raise ResolveError(f"input {name} : objet publié {inp.id} introuvable")
+                version = inp.version if inp.version is not None else pubs[-1].version
+                if not any(p.version == version for p in pubs):
+                    raise ResolveError(f"input {name} : version {version} introuvable")
+                records.append(InputRecord(sid, name, "ref", inp.kind, inp.id, version))
+                pinned[name] = Ref(inp.kind, inp.id, version)
+            else:
+                dt = self._data_types.get(inp.kind)
+                if dt is not None:
+                    try:
+                        value = dt.model.model_validate(
+                            inp.value.model_dump()
+                            if isinstance(inp.value, BaseModel)
+                            else inp.value
+                        )
+                    except ValidationError as e:
+                        raise ResolveError(f"input {name} : {e}") from e
+                    records.append(
+                        InputRecord(
+                            sid,
+                            name,
+                            "data",
+                            inp.kind,
+                            data=value.model_dump(mode="json"),
+                            data_version=dt.version,
+                        )
+                    )
+                    pinned[name] = Data(inp.kind, value)
+                else:
+                    records.append(InputRecord(sid, name, "data", inp.kind, data=inp.value))
+                    pinned[name] = inp
+        return records, pinned
 
     def _load_inputs(self, recs: list[InputRecord]) -> dict[str, Ref | Data]:
         out: dict[str, Ref | Data] = {}
@@ -331,8 +496,10 @@ class Agents[D]:
         title: str | None = None,
         metadata: dict[str, Any] | None = None,
         model: str | None = None,
+        model_settings: Mapping[str, Any] | None = None,
         _origin: dict[str, Any] | None = None,
     ) -> SessionInfo:
+        """Crée une session ; ``initial_messages`` de la définition pose ses messages (D96)."""
         d = self.definition(kind)
         inputs = dict(inputs or {})
         missing = set(d.inputs) - set(inputs)
@@ -341,50 +508,11 @@ class Agents[D]:
             raise ResolveError(
                 f"inputs attendus pour {kind} : {sorted(d.inputs)} ; reçus : {sorted(inputs)}"
             )
+        settings = self._check_settings(d, model_settings or {})
         sid = uuid7()
         ts = now()
         async with self.storage.transaction() as tx:
-            records: list[InputRecord] = []
-            pinned: dict[str, Ref | Data] = {}
-            for name, inp in sorted(inputs.items()):
-                if inp.kind != d.inputs[name]:
-                    raise ResolveError(
-                        f"input {name} : kind {d.inputs[name]} attendu, {inp.kind} reçu"
-                    )
-                if isinstance(inp, Ref):
-                    pubs = await tx.get_publications(inp.id)
-                    if not pubs or pubs[0].kind != inp.kind:
-                        raise ResolveError(f"input {name} : objet publié {inp.id} introuvable")
-                    version = inp.version if inp.version is not None else pubs[-1].version
-                    if not any(p.version == version for p in pubs):
-                        raise ResolveError(f"input {name} : version {version} introuvable")
-                    records.append(InputRecord(sid, name, "ref", inp.kind, inp.id, version))
-                    pinned[name] = Ref(inp.kind, inp.id, version)
-                else:
-                    dt = self._data_types.get(inp.kind)
-                    if dt is not None:
-                        try:
-                            value = dt.model.model_validate(
-                                inp.value.model_dump()
-                                if isinstance(inp.value, BaseModel)
-                                else inp.value
-                            )
-                        except ValidationError as e:
-                            raise ResolveError(f"input {name} : {e}") from e
-                        records.append(
-                            InputRecord(
-                                sid,
-                                name,
-                                "data",
-                                inp.kind,
-                                data=value.model_dump(mode="json"),
-                                data_version=dt.version,
-                            )
-                        )
-                        pinned[name] = Data(inp.kind, value)
-                    else:
-                        records.append(InputRecord(sid, name, "data", inp.kind, data=inp.value))
-                        pinned[name] = inp
+            records, pinned = await self._pin_inputs(tx, sid, d, inputs)
             state = d.make_initial_state(pinned)
             codec = self._codecs[kind]
             state_id: UUID | None = None
@@ -394,7 +522,21 @@ class Agents[D]:
                 await tx.insert_states(
                     [StateRecord(state_id, kind, codec.version, StateCodec.dump(state), ts)]
                 )
-            root = EntryRecord(uuid7(), sid, None, "root", {}, state_id, True, ts)
+            entries = [EntryRecord(uuid7(), sid, None, "root", {}, state_id, True, ts)]
+            if d.initial_messages_hook is not None:
+                ictx = InitContext[Any, Any](
+                    deps=self.deps,
+                    owner=owner,
+                    session_id=sid,
+                    kind=kind,
+                    inputs=pinned,
+                    state=state,
+                )
+                for role, content in await d.initial_messages_hook(ictx):
+                    body = _message_content(role, content)
+                    entries.append(
+                        EntryRecord(uuid7(), sid, entries[-1].id, role, body, state_id, True, ts)
+                    )
             o = _origin or {}
             rec = SessionRecord(
                 id=sid,
@@ -405,7 +547,8 @@ class Agents[D]:
                 title=title,
                 metadata=dict(metadata or {}),
                 model_override=model,
-                leaf_entry_id=root.id,
+                model_settings=settings,
+                leaf_entry_id=entries[-1].id,
                 origin_session_id=o.get("session_id"),
                 origin_entry_id=o.get("entry_id"),
                 origin_handler=o.get("handler"),
@@ -413,7 +556,7 @@ class Agents[D]:
             )
             await tx.insert_session(rec)
             await tx.insert_inputs(records)
-            await tx.insert_entries([root])
+            await tx.insert_entries(entries)
         return self._info(rec)
 
     async def get_session(self, session_id: UUID, owner: str) -> SessionInfo:
@@ -429,7 +572,10 @@ class Agents[D]:
         archived: bool = False,
         limit: int = 50,
         cursor: str | None = None,
+        object_id: UUID | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> Page[SessionInfo]:
+        """``object_id`` : sessions qui ont publié cet objet ; ``metadata`` : inclusion JSON (D102)."""
         before: tuple[datetime, UUID] | None = None
         if cursor:
             try:
@@ -445,6 +591,8 @@ class Agents[D]:
                 archived=archived,
                 limit=limit + 1,
                 before=before,
+                object_id=object_id,
+                metadata=dict(metadata) if metadata is not None else None,
             )
         nxt = None
         if len(rows) > limit:
@@ -470,19 +618,46 @@ class Agents[D]:
     async def set_model(self, session_id: UUID, owner: str, model: str | None) -> SessionInfo:
         return await self._patch_session(session_id, owner, model_override=model)
 
+    async def set_model_settings(
+        self, session_id: UUID, owner: str, settings: Mapping[str, Any]
+    ) -> SessionInfo:
+        """Remplace les réglages surchargés de la session (D92). ``{}`` revient à la définition."""
+        async with self.storage.transaction() as tx:
+            s = await self._session(tx, session_id, owner, for_update=True)
+            clean = self._check_settings(self.definition(s.kind), settings)
+            await tx.update_session(session_id, model_settings=clean, updated_at=now())
+            s = await self._session(tx, session_id, owner)
+        return self._info(s)
+
     async def archive(self, session_id: UUID, owner: str) -> SessionInfo:
         return await self._patch_session(session_id, owner, archived_at=now())
 
     async def unarchive(self, session_id: UUID, owner: str) -> SessionInfo:
         return await self._patch_session(session_id, owner, archived_at=None)
 
-    async def clone(self, session_id: UUID, owner: str, *, title: str | None = None) -> SessionInfo:
-        """Nouvelle session indépendante ; ne copie que la branche active (D17 ⚠️)."""
+    async def clone(
+        self,
+        session_id: UUID,
+        owner: str,
+        *,
+        title: str | None = None,
+        entry_id: UUID | None = None,
+    ) -> SessionInfo:
+        """Nouvelle session indépendante ; ne copie qu'un chemin (D17 ⚠️).
+
+        Sans ``entry_id`` : la branche active. Avec : le chemin jusqu'à cette entrée si c'est
+        un checkpoint ou un message utilisateur, sinon jusqu'au checkpoint au-dessus (D98).
+        """
         async with self.storage.transaction() as tx:
             s = await self._idle_session(tx, session_id, owner)
             tree = Tree(await tx.get_entries(session_id))
             assert s.leaf_entry_id is not None
-            target = tree.nearest_checkpoint(s.leaf_entry_id)
+            if entry_id is None:
+                target = tree.nearest_checkpoint(s.leaf_entry_id)
+            else:
+                target = tree.get(entry_id)
+                if not (target.is_checkpoint or target.type == "user"):
+                    target = tree.nearest_checkpoint(target.id)
             path = tree.path(target.id)
             inputs = await tx.get_inputs(session_id)
             new_id = uuid7()
@@ -492,20 +667,17 @@ class Agents[D]:
             for e in path:
                 mapping[e.id] = uuid7()
                 copies.append(
-                    EntryRecord(
+                    replace(
+                        e,
                         id=mapping[e.id],
                         session_id=new_id,
                         parent_id=mapping[e.parent_id] if e.parent_id else None,
-                        type=e.type,
-                        content=e.content,
-                        state_id=e.state_id,
-                        is_checkpoint=e.is_checkpoint,
-                        created_at=e.created_at,
-                        interrupted=e.interrupted,
                         turn_id=None,
-                        usage=e.usage,
+                        hidden_at=None,
+                        derived_from=mapping.get(e.derived_from) if e.derived_from else None,
                     )
                 )
+            copies[-1].is_checkpoint = True
             rec = SessionRecord(
                 id=new_id,
                 kind=s.kind,
@@ -515,6 +687,7 @@ class Agents[D]:
                 title=title if title is not None else s.title,
                 metadata=dict(s.metadata),
                 model_override=s.model_override,
+                model_settings=dict(s.model_settings),
                 leaf_entry_id=mapping[target.id],
                 cloned_from_session_id=s.id,
                 cloned_from_entry_id=target.id,
@@ -556,6 +729,8 @@ class Agents[D]:
                 assert entry_id is not None
                 tree = Tree(await tx.get_entries(session_id))
                 target = tree.get(entry_id)
+                if tree.is_hidden(target.id):
+                    raise InvalidTarget("l'entrée visée est dans une branche à la corbeille")
                 if trigger == "fork":
                     if target.type != "user" or target.parent_id is None:
                         raise InvalidTarget(
@@ -749,10 +924,23 @@ class Agents[D]:
     # ================================================================================
     # Arbre
     # ================================================================================
-    async def get_tree(self, session_id: UUID, owner: str) -> list[EntryView]:
+    async def get_tree(
+        self,
+        session_id: UUID,
+        owner: str,
+        *,
+        include_hidden: bool = False,
+        labeled: bool = False,
+    ) -> list[EntryView]:
+        """Toutes les entrées, hors corbeille (D100) ; ``labeled`` : points de sauvegarde seuls."""
         async with self.storage.transaction() as tx:
             await self._session(tx, session_id, owner)
-            return [entry_view(e) for e in await tx.get_entries(session_id)]
+            rows = await tx.get_entries(session_id)
+        return [
+            entry_view(e)
+            for e in rows
+            if (include_hidden or e.hidden_at is None) and (not labeled or e.label is not None)
+        ]
 
     async def get_branch(
         self, session_id: UUID, owner: str, *, entry_id: UUID | None = None
@@ -776,6 +964,8 @@ class Agents[D]:
         async with self.storage.transaction() as tx:
             await self._idle_session(tx, session_id, owner)
             tree = Tree(await tx.get_entries(session_id))
+            if tree.is_hidden(entry_id):
+                raise InvalidTarget("branche à la corbeille : la restaurer d'abord")
             target = tree.nearest_checkpoint(tree.latest_descendant(entry_id).id)
             await tx.update_session(
                 session_id, leaf_entry_id=target.id, pending=[], updated_at=now()
@@ -787,14 +977,297 @@ class Agents[D]:
         """Déplace la feuille sur un checkpoint. Rien n'est supprimé (D13)."""
         async with self.storage.transaction() as tx:
             await self._idle_session(tx, session_id, owner)
-            target = Tree(await tx.get_entries(session_id)).get(entry_id)
+            tree = Tree(await tx.get_entries(session_id))
+            target = tree.get(entry_id)
             if not target.is_checkpoint:
                 raise InvalidTarget("rollback : l'entrée visée n'est pas un checkpoint")
+            if tree.is_hidden(entry_id):
+                raise InvalidTarget("branche à la corbeille : la restaurer d'abord")
             await tx.update_session(
                 session_id, leaf_entry_id=target.id, pending=[], updated_at=now()
             )
             s = await self._session(tx, session_id, owner)
         return self._info(s)
+
+    async def label_entry(
+        self, session_id: UUID, owner: str, entry_id: UUID, label: str | None
+    ) -> EntryView:
+        """Nomme un checkpoint (point de sauvegarde, D95) ; ``None`` ou ``""`` retire le nom."""
+        async with self.storage.transaction() as tx:
+            await self._session(tx, session_id, owner, for_update=True)
+            e = await self._entry(tx, session_id, entry_id)
+            if not e.is_checkpoint:
+                raise InvalidTarget("seul un checkpoint peut être nommé")
+            e.label = (label or "").strip() or None
+            await tx.update_entry(e.id, label=e.label)
+        return entry_view(e)
+
+    async def set_entry_metadata(
+        self, session_id: UUID, owner: str, entry_id: UUID, metadata: Mapping[str, Any]
+    ) -> EntryView:
+        """Fusionne des clés de premier niveau dans les métadonnées d'une entrée (D101).
+
+        Une valeur ``None`` supprime la clé. Aucun événement n'est émis.
+        """
+        async with self.storage.transaction() as tx:
+            await self._session(tx, session_id, owner, for_update=True)
+            e = await self._entry(tx, session_id, entry_id)
+            merged = {**e.metadata, **metadata}
+            e.metadata = {k: v for k, v in merged.items() if v is not None}
+            await tx.update_entry(e.id, metadata=e.metadata)
+        return entry_view(e)
+
+    async def hide_branch(self, session_id: UUID, owner: str, entry_id: UUID) -> list[UUID]:
+        """Met à la corbeille l'entrée et sa descendance (D100). Renvoie les entrées masquées.
+
+        Refusé pour la racine et pour toute entrée du chemin actif (``InvalidTarget``).
+        """
+        async with self.storage.transaction() as tx:
+            s = await self._idle_session(tx, session_id, owner)
+            tree = Tree(await tx.get_entries(session_id))
+            target = tree.get(entry_id)
+            assert s.leaf_entry_id is not None
+            if target.parent_id is None or any(
+                e.id == entry_id for e in tree.path(s.leaf_entry_id)
+            ):
+                raise InvalidTarget("corbeille : la racine et la branche active ne se masquent pas")
+            ts = now()
+            ids = [e.id for e in tree.subtree(entry_id) if e.hidden_at is None]
+            for i in ids:
+                await tx.update_entry(i, hidden_at=ts)
+        return ids
+
+    async def restore_branch(self, session_id: UUID, owner: str, entry_id: UUID) -> list[UUID]:
+        """Sort de la corbeille ce qui y a été mis avec ``entry_id`` (D100)."""
+        async with self.storage.transaction() as tx:
+            await self._session(tx, session_id, owner, for_update=True)
+            tree = Tree(await tx.get_entries(session_id))
+            target = tree.get(entry_id)
+            if target.hidden_at is None:
+                return []
+            if target.parent_id is not None and tree.is_hidden(target.parent_id):
+                raise InvalidTarget("restaurer d'abord la branche parente")
+            ids = [e.id for e in tree.subtree(entry_id) if e.hidden_at == target.hidden_at]
+            for i in ids:
+                await tx.update_entry(i, hidden_at=None)
+        return ids
+
+    # ================================================================================
+    # Messages hors tour
+    # ================================================================================
+    async def append_message(
+        self,
+        session_id: UUID,
+        owner: str,
+        role: Literal["user", "assistant"],
+        content: Any,
+        *,
+        parent_entry_id: UUID | None = None,
+    ) -> EntryView:
+        """Ajoute un message sans appeler le modèle (D96) : checkpoint, devient la feuille.
+
+        Sous la feuille, les questions en attente sont annulées comme pour ``send_message``.
+        """
+        body = _message_content(role, content)
+        async with self.storage.transaction() as tx:
+            s = await self._idle_session(tx, session_id, owner)
+            tree = Tree(await tx.get_entries(session_id))
+            assert s.leaf_entry_id is not None
+            parent = tree.get(parent_entry_id or s.leaf_entry_id)
+            on_leaf = parent.id == s.leaf_entry_id
+            if not on_leaf and not parent.is_checkpoint:
+                raise InvalidTarget("le parent d'un message ajouté doit être un checkpoint")
+            if tree.is_hidden(parent.id):
+                raise InvalidTarget("branche à la corbeille : la restaurer d'abord")
+            version = self.codec(s.kind).version
+            b = Builder(session_id, None, s.kind, version, parent.id, parent.state_id, None)
+            if on_leaf:
+                _cancel_pending(b, s.pending)
+            e = b.add(role, body, checkpoint=True)
+            await b.write(tx)
+            await tx.update_session(session_id, leaf_entry_id=e.id, pending=[], updated_at=now())
+        return entry_view(e)
+
+    async def edit_entry(
+        self, session_id: UUID, owner: str, entry_id: UUID, content: Any
+    ) -> EntryView:
+        """Corrige un message sans relancer le modèle (D97).
+
+        Crée une copie sœur au contenu modifié (``derived_from`` = l'original, qui reste dans
+        l'arbre) et recopie dessous la suite de la branche ; la feuille passe sur la copie.
+        Pour un message assistant, seul le texte change (raisonnement et appels d'outils gardés).
+        """
+        async with self.storage.transaction() as tx:
+            s = await self._idle_session(tx, session_id, owner)
+            tree = Tree(await tx.get_entries(session_id))
+            target = tree.get(entry_id)
+            if target.type not in ("user", "assistant"):
+                raise InvalidTarget("seuls les messages user et assistant s'éditent")
+            if tree.is_hidden(target.id):
+                raise InvalidTarget("branche à la corbeille : la restaurer d'abord")
+            body = _edited_content(target, content)
+            assert s.leaf_entry_id is not None
+            active = tree.path(s.leaf_entry_id)
+            pending: list[dict[str, Any]] = []
+            if any(e.id == target.id for e in active):
+                tail = active[[e.id for e in active].index(target.id) + 1 :]
+                pending = s.pending
+            else:
+                end = tree.latest_descendant(target.id)
+                tail = tree.path(end.id)[len(tree.path(target.id)) :]
+                while tail and not tail[-1].is_checkpoint:
+                    tail.pop()
+            ts = now()
+            first = replace(
+                target,
+                id=uuid7(),
+                content=body,
+                created_at=ts,
+                derived_from=target.id,
+                turn_id=None,
+                usage=None,
+                label=None,
+            )
+            copies = [first]
+            for e in tail:
+                copies.append(
+                    replace(e, id=uuid7(), parent_id=copies[-1].id, created_at=ts, turn_id=None)
+                )
+            for q in pending:
+                result = tool_result_content(
+                    q["tool_call_id"], q["tool_name"], CANCELLED_QUESTION, False
+                )
+                copies.append(
+                    EntryRecord(
+                        uuid7(),
+                        session_id,
+                        copies[-1].id,
+                        "tool_result",
+                        result,
+                        copies[-1].state_id,
+                        False,
+                        ts,
+                    )
+                )
+            copies[-1].is_checkpoint = True
+            await tx.insert_entries(copies)
+            await tx.update_session(
+                session_id, leaf_entry_id=copies[-1].id, pending=[], updated_at=now()
+            )
+        return entry_view(first)
+
+    # ================================================================================
+    # Inputs
+    # ================================================================================
+    async def update_inputs(
+        self, session_id: UUID, owner: str, inputs: Mapping[str, Ref | Data]
+    ) -> EntryView:
+        """Change des inputs après la création (D99) : entrée ``input_update`` (checkpoint).
+
+        Les inputs effectifs dépendent de la branche : un rollback avant l'entrée les rétablit.
+        """
+        async with self.storage.transaction() as tx:
+            s = await self._idle_session(tx, session_id, owner)
+            d = self.definition(s.kind)
+            unknown = sorted(set(inputs) - set(d.inputs))
+            if unknown or not inputs:
+                raise ResolveError(f"inputs déclarés pour {s.kind} : {sorted(d.inputs)}")
+            records, _ = await self._pin_inputs(tx, session_id, d, inputs)
+            assert s.leaf_entry_id is not None
+            leaf = await self._entry(tx, session_id, s.leaf_entry_id)
+            version = self.codec(s.kind).version
+            b = Builder(session_id, None, s.kind, version, leaf.id, leaf.state_id, None)
+            _cancel_pending(b, s.pending)
+            content = {"inputs": {r.name: _input_content(r) for r in records}}
+            e = b.add("input_update", content, checkpoint=True)
+            await b.write(tx)
+            await tx.update_session(session_id, leaf_entry_id=e.id, pending=[], updated_at=now())
+        return entry_view(e)
+
+    async def get_inputs(
+        self, session_id: UUID, owner: str, *, entry_id: UUID | None = None
+    ) -> dict[str, InputView]:
+        """Inputs effectifs à ``entry_id`` (défaut : la feuille)."""
+        async with self.storage.transaction() as tx:
+            s = await self._session(tx, session_id, owner)
+            tree = Tree(await tx.get_entries(session_id))
+            recs = await tx.get_inputs(session_id)
+        target = entry_id or s.leaf_entry_id
+        assert target is not None
+        effective = self._load_inputs(self._effective_input_records(recs, tree.path(target)))
+        return {name: _input_view(inp) for name, inp in effective.items()}
+
+    # ================================================================================
+    # Aperçu de requête
+    # ================================================================================
+    async def preview_request(
+        self, session_id: UUID, owner: str, content: Any = None
+    ) -> ModelRequest:
+        """Requête du prochain appel au modèle, sans tour, sans verrou ni écriture (D93).
+
+        Avec ``content`` : comme si ce message était envoyé (questions en attente annulées).
+        """
+        user_body = _message_content("user", content) if content is not None else None
+        async with self.storage.transaction() as tx:
+            s = await self._session(tx, session_id, owner)
+            tree = Tree(await tx.get_entries(session_id))
+            input_recs = await tx.get_inputs(session_id)
+            assert s.leaf_entry_id is not None
+            path = tree.path(s.leaf_entry_id)
+            state = await self._state_at(tx, s.kind, path[-1])
+        d = self.definition(s.kind)
+        codec = self.codec(s.kind)
+        if state is None and codec.state_type is not None:
+            state = d.make_initial_state({})
+        branch = [entry_view(e) for e in path]
+        if user_body is not None:
+            leaf = path[-1]
+            b = Builder(session_id, None, s.kind, codec.version, leaf.id, leaf.state_id, None)
+            _cancel_pending(b, s.pending)
+            b.add("user", user_body)
+            branch += [entry_view(e) for e in b.entries]
+        inputs = self._load_inputs(self._effective_input_records(input_recs, path))
+        resolved = await self._resolve_inputs(inputs, s.owner, session_id)
+        return await build_request(
+            self,
+            d,
+            state=state,
+            owner=s.owner,
+            session_id=session_id,
+            turn_id=None,
+            model=s.model_override or d.model,
+            model_settings=s.model_settings,
+            inputs=inputs,
+            resolved=resolved,
+            branch=branch,
+        )
+
+    async def estimate(self, request: ModelRequest) -> Estimate | None:
+        """Estimation du client (``ModelClient.estimate``), ``None`` s'il n'en propose pas."""
+        fn = getattr(self.model_client, "estimate", None)
+        if fn is None:
+            return None
+        try:
+            return await fn(request)
+        except Exception:
+            log.warning("estimation impossible pour %s", request.model, exc_info=True)
+            return None
+
+    async def preview(
+        self, session_id: UUID, owner: str, content: Any = None, *, expose_prompt: bool = True
+    ) -> RequestPreview:
+        """Aperçu sérialisable : modèle, réglages, estimation et, si exposé, le prompt exact."""
+        request = await self.preview_request(session_id, owner, content)
+        est = await self.estimate(request)
+        return RequestPreview(
+            model=request.model,
+            settings=dict(request.settings),
+            input_tokens=est.input_tokens if est else None,
+            cost=est.cost if est else None,
+            system=request.system if expose_prompt else None,
+            messages=list(request.messages) if expose_prompt else None,
+            tools=[asdict(t) for t in request.tools] if expose_prompt else None,
+        )
 
     # ================================================================================
     # État
@@ -817,8 +1290,14 @@ class Agents[D]:
             state_id=entry.state_id,
         )
 
-    async def edit_state(self, session_id: UUID, owner: str, state: Any) -> EntryView:
-        """Édition manuelle : entrée ``state_edit`` (checkpoint) ; annule les questions en attente (D43)."""
+    async def edit_state(
+        self, session_id: UUID, owner: str, state: Any, *, amend: bool = False
+    ) -> EntryView:
+        """Édition manuelle : entrée ``state_edit`` (checkpoint) ; annule les questions en attente (D43).
+
+        ``amend=True`` (sauvegarde automatique, D94) : si la feuille est déjà un ``state_edit``
+        sans suite, sans nom et non publié, elle est réécrite au lieu d'en empiler un autre.
+        """
         async with self.storage.transaction() as tx:
             s = await self._idle_session(tx, session_id, owner)
             codec = self.codec(s.kind)
@@ -826,18 +1305,13 @@ class Agents[D]:
                 raise InvalidTarget(f"le kind {s.kind} n'a pas d'état")
             new_state = codec.validate(state)
             assert s.leaf_entry_id is not None
-            leaf = await tx.get_entry(s.leaf_entry_id)
-            assert leaf is not None
-            old = StateCodec.dump(await self._state_at(tx, s.kind, leaf))
+            leaf = await self._entry(tx, session_id, s.leaf_entry_id)
             new = StateCodec.dump(new_state)
+            if amend and await self._amendable(tx, s, leaf):
+                return await self._amend_state_edit(tx, s, leaf, new)
+            old = StateCodec.dump(await self._state_at(tx, s.kind, leaf))
             b = Builder(session_id, None, s.kind, codec.version, leaf.id, leaf.state_id, old)
-            for q in s.pending:
-                b.add(
-                    "tool_result",
-                    tool_result_content(
-                        q["tool_call_id"], q["tool_name"], CANCELLED_QUESTION, False
-                    ),
-                )
+            _cancel_pending(b, s.pending)
             patch = b.set_state(new)
             if not patch and not s.pending:
                 return entry_view(leaf)
@@ -845,6 +1319,167 @@ class Agents[D]:
             await b.write(tx)
             await tx.update_session(session_id, leaf_entry_id=e.id, pending=[], updated_at=now())
         return entry_view(e)
+
+    async def _amendable(self, tx: StorageTx, s: SessionRecord, leaf: EntryRecord) -> bool:
+        if leaf.type != "state_edit" or leaf.label is not None or s.pending:
+            return False
+        if any(e.parent_id == leaf.id for e in await tx.get_entries(s.id)):
+            return False
+        if s.object_id is not None:
+            pubs = await tx.get_publications(s.object_id)
+            if any(p.entry_id == leaf.id for p in pubs):
+                return False
+        return True
+
+    async def _amend_state_edit(
+        self, tx: StorageTx, s: SessionRecord, leaf: EntryRecord, new: dict[str, Any] | None
+    ) -> EntryView:
+        assert leaf.parent_id is not None
+        parent = await self._entry(tx, s.id, leaf.parent_id)
+        base = StateCodec.dump(await self._state_at(tx, s.kind, parent))
+        patch = jsonpatch.diff(base, new)
+        old_state_id = leaf.state_id
+        if patch:
+            state_id = uuid7()
+            version = self.codec(s.kind).version
+            await tx.insert_states([StateRecord(state_id, s.kind, version, new, now())])
+        else:
+            state_id = parent.state_id
+        leaf.content, leaf.state_id = {"patch": patch}, state_id
+        await tx.update_entry(leaf.id, content=leaf.content, state_id=state_id)
+        if old_state_id is not None and old_state_id != state_id:
+            await tx.delete_unused_states([old_state_id])
+        await tx.update_session(s.id, updated_at=now())
+        return entry_view(leaf)
+
+    # ================================================================================
+    # Import (D104)
+    # ================================================================================
+    async def import_session(
+        self,
+        owner: str,
+        kind: str,
+        *,
+        entries: Sequence[ImportedEntry],
+        leaf_id: UUID | None = None,
+        initial_state: Any = None,
+        inputs: Mapping[str, Ref | Data] | None = None,
+        title: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        model: str | None = None,
+        model_settings: Mapping[str, Any] | None = None,
+        object_id: UUID | None = None,
+        publications: Sequence[ImportedPublication] = (),
+        created_at: datetime | None = None,
+    ) -> SessionInfo:
+        """Importe un historique existant en une transaction, sans appel LLM (D104).
+
+        Dates et ids conservés ; ni ``initial_messages`` ni ``on_publish`` ne sont appelés.
+        ``leaf_id`` (défaut : la dernière entrée) doit être un checkpoint.
+        """
+        d = self.definition(kind)
+        codec = self.codec(kind)
+        inputs = dict(inputs or {})
+        if set(inputs) != set(d.inputs):
+            raise ResolveError(
+                f"inputs attendus pour {kind} : {sorted(d.inputs)} ; reçus : {sorted(inputs)}"
+            )
+        settings = self._check_settings(d, model_settings or {})
+        sid = uuid7()
+        start = created_at or min((e.created_at for e in entries), default=now())
+        async with self.storage.transaction() as tx:
+            records, pinned = await self._pin_inputs(tx, sid, d, inputs)
+            states: list[StateRecord] = []
+            if initial_state is not None or codec.state_type is not None:
+                root_state = codec.validate(
+                    initial_state if initial_state is not None else d.make_initial_state(pinned)
+                )
+                root_dump = StateCodec.dump(root_state)
+                root_state_id: UUID | None = uuid7()
+                states.append(StateRecord(root_state_id, kind, codec.version, root_dump, start))
+            else:
+                root_dump, root_state_id = None, None
+            root = EntryRecord(uuid7(), sid, None, "root", {}, root_state_id, True, start)
+            recs: dict[UUID, EntryRecord] = {}
+            dumps: dict[UUID, Any] = {root.id: root_dump}
+            for item in entries:
+                if item.id in recs:
+                    raise InvalidTarget(f"import : entrée {item.id} en double")
+                parent = root if item.parent_id is None else recs.get(item.parent_id)
+                if parent is None:
+                    raise InvalidTarget(f"import : parent {item.parent_id} absent ou placé après")
+                state_id, dump = parent.state_id, dumps[parent.id]
+                if item.type == "state_edit":
+                    if codec.state_type is None:
+                        raise InvalidTarget(f"le kind {kind} n'a pas d'état")
+                    dump = StateCodec.dump(codec.validate(item.state))
+                    content: dict[str, Any] = {"patch": jsonpatch.diff(dumps[parent.id], dump)}
+                    if content["patch"]:
+                        state_id = uuid7()
+                        states.append(
+                            StateRecord(state_id, kind, codec.version, dump, item.created_at)
+                        )
+                elif item.type in ("user", "assistant"):
+                    content = _message_content(item.type, item.content)
+                else:
+                    raise InvalidTarget(f"import : type d'entrée {item.type} non importable")
+                recs[item.id] = EntryRecord(
+                    item.id,
+                    sid,
+                    parent.id,
+                    item.type,
+                    content,
+                    state_id,
+                    item.checkpoint or item.type == "state_edit",
+                    item.created_at,
+                    label=item.label if item.checkpoint else None,
+                    metadata=dict(item.metadata),
+                )
+                dumps[item.id] = dump
+            leaf = recs[leaf_id] if leaf_id is not None else (list(recs.values()) or [root])[-1]
+            if leaf_id is not None and leaf_id not in recs:
+                raise InvalidTarget(f"import : feuille {leaf_id} absente")
+            if not leaf.is_checkpoint:
+                raise InvalidTarget("import : la feuille doit être un checkpoint")
+            pub_recs: list[PublicationRecord] = []
+            if publications:
+                object_id = object_id or uuid7()
+                if await tx.get_publications(object_id):
+                    raise InvalidTarget(f"import : l'objet {object_id} a déjà des publications")
+                last = 0
+                for p in publications:
+                    e = recs.get(p.entry_id)
+                    if p.version <= last:
+                        raise InvalidTarget("import : versions publiées non croissantes")
+                    if e is None or not e.is_checkpoint or e.state_id is None:
+                        raise InvalidTarget(f"import : publication sur {p.entry_id} impossible")
+                    last = p.version
+                    pub_recs.append(
+                        PublicationRecord(
+                            kind, object_id, p.version, sid, e.id, e.state_id, owner, p.published_at
+                        )
+                    )
+            rec = SessionRecord(
+                id=sid,
+                kind=kind,
+                owner=owner,
+                created_at=start,
+                updated_at=max([start, *(e.created_at for e in recs.values())]),
+                title=title,
+                metadata=dict(metadata or {}),
+                model_override=model,
+                model_settings=settings,
+                leaf_entry_id=leaf.id,
+                object_id=object_id if pub_recs else None,
+            )
+            await tx.insert_session(rec)
+            await tx.insert_inputs(records)
+            if states:
+                await tx.insert_states(states)
+            await tx.insert_entries([root, *recs.values()])
+            for p in pub_recs:
+                await tx.insert_publication(p)
+        return self._info(rec)
 
     # ================================================================================
     # Publication

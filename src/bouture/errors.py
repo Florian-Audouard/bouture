@@ -31,6 +31,10 @@ class StateVersionError(BoutureError):
     """Version d'état stockée plus récente que celle du code, ou migration manquante."""
 
 
+class InvalidSettings(BoutureError):
+    """Réglage de modèle non surchargeable pour ce kind (D92)."""
+
+
 class ResolveError(BoutureError):
     """Un input ne peut pas être résolu (référence morte, kind inattendu…)."""
 

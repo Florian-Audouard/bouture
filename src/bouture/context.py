@@ -103,6 +103,29 @@ class PurgeContext[D]:
 
 
 @dataclass
+class InitContext[S, D]:
+    """Reçu par ``initial_messages`` : la session est en cours de création (D96)."""
+
+    deps: D
+    owner: str
+    session_id: UUID
+    kind: str
+    inputs: Mapping[str, Ref | Data]
+    state: S | None
+
+
+@dataclass
+class EntriesContext[D]:
+    """Reçu par ``on_entries`` (D101). ``db`` est lié à la transaction du commit du tour."""
+
+    db: Any
+    deps: D
+    owner: str
+    session_id: UUID
+    turn_id: UUID
+
+
+@dataclass
 class BuildContext[S, D]:
     """Reçu par ``build_context`` ; ``default_request()`` donne le comportement par défaut."""
 
@@ -116,6 +139,8 @@ class BuildContext[S, D]:
     resolved_inputs: Mapping[str, str]
     branch: Sequence[EntryView]
     tools: list[Any]
+    model_settings: Mapping[str, Any] = field(default_factory=dict[str, Any])
+    """Réglages surchargés par la session, prioritaires sur ceux de la définition (D92)."""
 
     def system_prompt(self) -> str:
         sp = self.definition.system_prompt
@@ -145,7 +170,7 @@ class BuildContext[S, D]:
             system=system,
             messages=messages,
             tools=self.tools,
-            settings=dict(self.definition.model_settings),
+            settings={**self.definition.model_settings, **self.model_settings},
         )
 
 
@@ -180,6 +205,9 @@ def entries_to_messages(branch: Sequence[EntryView]) -> list[Message]:
                     "appliqué à l'état."
                 )
             )
+        elif e.type == "input_update":
+            names = ", ".join(sorted(c.get("inputs", {})))
+            out.append(_note(f"Les références suivantes ont changé : {names}."))
         elif e.type == "summary":
             out.append(_note(f"Résumé de la conversation précédente : {c.get('text', '')}"))
     return out

@@ -6,14 +6,14 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
 from . import jsonpatch
-from .context import BuildContext, ChildResultContext, ToolContext
+from .context import BuildContext, ChildResultContext, EntriesContext, ToolContext
 from .definition import AgentDefinition, AskUser
 from .errors import BoutureError, ModelError, StateValidationError, ToolFatal
 from .events import EventSink, now
@@ -29,18 +29,20 @@ from .messages import (
     normalize_content,
 )
 from .models.base import (
+    CallContext,
     ModelEvent,
     ModelRequest,
     ReasoningDelta,
     TextDelta,
     ToolCallComplete,
+    ToolCallDelta,
     UsageReport,
 )
-from .refs import PublishedRef
+from .refs import Data, PublishedRef, Ref
 from .state import StateCodec
 from .storage.base import EntryRecord, NewEvent, SessionRecord, StateRecord, StorageTx
 from .tree import Tree
-from .views import TurnResult, entry_view
+from .views import EntryView, TurnResult, entry_view
 
 if TYPE_CHECKING:
     from .agents import Agents
@@ -157,6 +159,43 @@ def revalidate(codec: StateCodec, state: Any) -> BaseModel:
     except Exception as e:
         raise StateValidationError(str(e)) from e
     return codec.validate(raw)
+
+
+async def build_request(
+    agents: Agents[Any],
+    definition: AgentDefinition[Any, Any],
+    *,
+    state: Any,
+    owner: str,
+    session_id: UUID,
+    turn_id: UUID | None,
+    model: str,
+    model_settings: Mapping[str, Any],
+    inputs: Mapping[str, Ref | Data],
+    resolved: Mapping[str, str],
+    branch: Sequence[EntryView],
+) -> ModelRequest:
+    """Requête LLM d'une étape : ``build_context`` du projet ou comportement par défaut."""
+    bctx = BuildContext[Any, Any](
+        definition=definition,
+        state=state,
+        deps=agents.deps,
+        owner=owner,
+        session_id=session_id,
+        model=model,
+        inputs=inputs,
+        resolved_inputs=resolved,
+        branch=branch,
+        tools=[t.spec() for t in definition.tools.values()],
+        model_settings=model_settings,
+    )
+    if definition.context_builder is not None:
+        request = await definition.context_builder(bctx)
+    else:
+        request = bctx.default_request()
+    if request.context is None:
+        request.context = CallContext(owner, session_id, definition.kind, turn_id)
+    return request
 
 
 async def _aclose(it: AsyncIterator[ModelEvent]) -> None:
@@ -298,6 +337,7 @@ class TurnExecutor:
         self.definition: AgentDefinition[Any, Any] = a.definition(s.kind)
         self.codec = a.codec(s.kind)
         self.model = s.model_override or self.definition.model
+        self.model_settings = dict(s.model_settings)
         if self.trigger in ("message", "answer"):
             self.pending = list(s.pending)
         rec = states.get(attach.state_id) if attach.state_id else None
@@ -313,7 +353,7 @@ class TurnExecutor:
             attach.state_id,
             StateCodec.dump(self.state),
         )
-        self.inputs = a._load_inputs(input_recs)  # pyright: ignore[reportPrivateUsage]
+        self.inputs = a._load_inputs(a._effective_input_records(input_recs, self.base_path))  # pyright: ignore[reportPrivateUsage]
         self.resolved = await a._resolve_inputs(self.inputs, self.owner, self.session_id)  # pyright: ignore[reportPrivateUsage]
 
     # -- déroulé ---------------------------------------------------------------------
@@ -399,21 +439,19 @@ class TurnExecutor:
         branch = [entry_view(e) for e in self.base_path] + [
             entry_view(e) for e in self.builder.entries
         ]
-        bctx = BuildContext[Any, Any](
-            definition=d,
+        return await build_request(
+            self.agents,
+            d,
             state=self.state,
-            deps=self.agents.deps,
             owner=self.owner,
             session_id=self.session_id,
+            turn_id=self.turn_id,
             model=self.model,
+            model_settings=self.model_settings,
             inputs=self.inputs,
-            resolved_inputs=self.resolved,
+            resolved=self.resolved,
             branch=branch,
-            tools=[t.spec() for t in d.tools.values()],
         )
-        if d.context_builder is not None:
-            return await d.context_builder(bctx)
-        return bctx.default_request()
 
     # -- appel au modèle -------------------------------------------------------------
     def _append(self, kind: str, text: str, signature: str | None = None) -> None:
@@ -438,9 +476,11 @@ class TurnExecutor:
         self._open_msg = {"id": entry_id, "blocks": [], "calls": []}
         await self.sink.emit("message_start", {"entry_id": str(entry_id), "role": "assistant"})
         usage = Usage(model=request.model)
+        stream_args = self.definition.stream_tool_args
         attempt = 0
         while True:
             got_token = False
+            partial: dict[int, list[str | None]] = {}
             stream = a.model_client.stream(request)
             try:
                 async for ev in stream:
@@ -452,6 +492,15 @@ class TurnExecutor:
                         got_token = True
                         self._append("reasoning", ev.text, ev.signature)
                         await self.sink.delta("reasoning_delta", entry_id, ev.text)
+                    elif isinstance(ev, ToolCallDelta):
+                        got_token = True
+                        if stream_args:
+                            known = partial.setdefault(ev.index, [None, None])
+                            known[0] = known[0] or ev.id
+                            known[1] = known[1] or ev.name
+                            await self.sink.tool_delta(
+                                entry_id, ev.index, known[0], known[1], ev.args_delta
+                            )
                     elif isinstance(ev, ToolCallComplete):
                         got_token = True
                         call = ToolCallBlock(id=ev.id, name=ev.name, args=ev.args)
@@ -671,6 +720,8 @@ class TurnExecutor:
                         a, tx, s, self.owner, b, self.state, self.sink
                     )
                     events += evs
+                if meta := await self._entry_metadata(tx, b):
+                    events.append(self.sink.new("entry_metadata", {"entries": meta}))
                 await b.write(tx)
                 leaf = b.leaf_id
             await tx.update_session(
@@ -708,6 +759,32 @@ class TurnExecutor:
             usage=self.usage,
             error=error,
         )
+
+    async def _entry_metadata(self, tx: StorageTx, b: Builder) -> dict[str, dict[str, Any]]:
+        """Appelle ``on_entries`` sur les entrées du tour ; renvoie les métadonnées posées (D101)."""
+        hook = self.definition.entries_hook
+        if hook is None or not b.entries:
+            return {}
+        ctx = EntriesContext[Any](
+            db=tx.db,
+            deps=self.agents.deps,
+            owner=self.owner,
+            session_id=self.session_id,
+            turn_id=self.turn_id,
+        )
+        try:
+            result = await hook(ctx, [entry_view(e) for e in b.entries])
+        except Exception:
+            log.exception("tour %s : on_entries a échoué", self.turn_id)
+            return {}
+        by_id = {e.id: e for e in b.entries}
+        out: dict[str, dict[str, Any]] = {}
+        for entry_id, data in result.items():
+            e = by_id.get(entry_id)
+            if e is not None and data:
+                e.metadata = {**e.metadata, **data}
+                out[str(e.id)] = e.metadata
+        return out
 
 
 async def apply_child_results(

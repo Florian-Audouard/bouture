@@ -124,3 +124,97 @@ async def test_routes_answer_conflict(client: httpx.AsyncClient) -> None:
     sid = (await client.post("/agents/sessions", json={"kind": "note"}, headers=ALICE)).json()["id"]
     r = await client.post(f"/agents/sessions/{sid}/answer", json={"answer": "oui"}, headers=ALICE)
     assert r.status_code == 409 and r.json()["error"] == "NotAwaitingInput"
+
+
+async def test_routes_integration(client: httpx.AsyncClient, fake: FakeModelClient) -> None:
+    """Routes des besoins d'intégration (D92–D105)."""
+    r = await client.post(
+        "/agents/sessions",
+        json={"kind": "note", "model_settings": {"api_key": "x"}},
+        headers=ALICE,
+    )
+    assert r.status_code == 422 and r.json()["error"] == "InvalidSettings"
+    r = await client.post(
+        "/agents/sessions",
+        json={"kind": "note", "metadata": {"app": "a1"}, "model_settings": {"temperature": 0.3}},
+        headers=ALICE,
+    )
+    sid = r.json()["id"]
+    assert r.json()["model_settings"] == {"temperature": 0.3}
+    base = f"/agents/sessions/{sid}"
+
+    r = await client.patch(base, json={"model_settings": {"top_p": 0.9}}, headers=ALICE)
+    assert r.json()["model_settings"] == {"top_p": 0.9}
+    r = await client.post(f"{base}/preview", json={"content": "salut"}, headers=ALICE)
+    assert r.status_code == 200 and r.json()["input_tokens"] > 0 and r.json()["system"]
+    assert r.json()["settings"] == {"top_p": 0.9}
+
+    r = await client.post(
+        f"{base}/entries", json={"role": "assistant", "content": "Bonjour !"}, headers=ALICE
+    )
+    assert r.status_code == 201
+    greeting = r.json()["id"]
+    r = await client.patch(f"{base}/entries/{greeting}", json={"content": "Salut !"}, headers=ALICE)
+    assert r.json()["derived_from"] == greeting
+    edited = r.json()["id"]
+    r = await client.put(f"{base}/entries/{edited}/label", json={"label": "Départ"}, headers=ALICE)
+    assert r.json()["label"] == "Départ"
+    r = await client.patch(
+        f"{base}/entries/{edited}/metadata", json={"metadata": {"k": 1}}, headers=ALICE
+    )
+    assert r.json()["metadata"] == {"k": 1}
+    r = await client.get(f"{base}/tree", params={"labeled": True}, headers=ALICE)
+    assert [e["id"] for e in r.json()] == [edited]
+
+    r = await client.post(f"{base}/entries/{greeting}/hide", headers=ALICE)
+    assert r.json()["entry_ids"] == [greeting]
+    assert greeting not in {
+        e["id"] for e in (await client.get(f"{base}/tree", headers=ALICE)).json()
+    }
+    r = await client.get(f"{base}/tree", params={"include_hidden": True}, headers=ALICE)
+    assert greeting in {e["id"] for e in r.json()}
+    r = await client.post(f"{base}/entries/{edited}/hide", headers=ALICE)
+    assert r.status_code == 409
+    r = await client.post(f"{base}/entries/{greeting}/restore", headers=ALICE)
+    assert r.json()["entry_ids"] == [greeting]
+
+    r = await client.put(
+        f"{base}/state", json={"state": {"title": "A"}, "amend": True}, headers=ALICE
+    )
+    first = r.json()["id"]
+    r = await client.put(
+        f"{base}/state", json={"state": {"title": "AB"}, "amend": True}, headers=ALICE
+    )
+    assert r.json()["id"] == first
+
+    assert (await client.get(f"{base}/inputs", headers=ALICE)).json() == {}
+    r = await client.patch(f"{base}/inputs", json={"inputs": {"x": {"kind": "y"}}}, headers=ALICE)
+    assert r.status_code == 422
+
+    r = await client.post(f"{base}/clone", json={"entry_id": edited}, headers=ALICE)
+    assert r.status_code == 201
+    clone_id = r.json()["id"]
+    clone_branch = (await client.get(f"/agents/sessions/{clone_id}/branch", headers=ALICE)).json()
+    assert [e["type"] for e in clone_branch] == ["root", "assistant"]
+
+    # Le clone garde les métadonnées : il est retrouvé aussi.
+    r = await client.get("/agents/sessions", params={"metadata": '{"app": "a1"}'}, headers=ALICE)
+    assert {s["id"] for s in r.json()["items"]} == {sid, clone_id}
+    r = await client.get("/agents/sessions", params={"metadata": "[1]"}, headers=ALICE)
+    assert r.status_code == 422
+    obj = (await client.post(f"{base}/publish", headers=ALICE)).json()["object_id"]
+    r = await client.get("/agents/sessions", params={"object_id": obj}, headers=ALICE)
+    assert [s["id"] for s in r.json()["items"]] == [sid]
+
+
+async def test_preview_route_can_hide_prompt(agents: Agents[Any]) -> None:
+    async def current_user() -> str:
+        return "alice"
+
+    app = FastAPI()
+    app.include_router(make_router(agents, current_user, expose_prompt=False))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        sid = (await c.post("/sessions", json={"kind": "note"})).json()["id"]
+        body = (await c.post(f"/sessions/{sid}/preview")).json()
+    assert body["system"] is None and body["messages"] is None and body["input_tokens"] > 0

@@ -12,10 +12,15 @@ from .storage.base import EntryRecord
 class Tree:
     def __init__(self, entries: Iterable[EntryRecord]) -> None:
         self.by_id: dict[UUID, EntryRecord] = {}
+        # ``children`` ignore les branches à la corbeille (D100) ; ``all_children`` non.
         self.children: dict[UUID | None, list[EntryRecord]] = {}
-        for e in sorted(entries, key=lambda e: e.id):
+        self.all_children: dict[UUID | None, list[EntryRecord]] = {}
+        # Ordre chronologique, l'id départage (D104 : une entrée importée garde sa date).
+        for e in sorted(entries, key=lambda e: (e.created_at, e.id)):
             self.by_id[e.id] = e
-            self.children.setdefault(e.parent_id, []).append(e)
+            self.all_children.setdefault(e.parent_id, []).append(e)
+            if e.hidden_at is None:
+                self.children.setdefault(e.parent_id, []).append(e)
 
     def get(self, entry_id: UUID) -> EntryRecord:
         try:
@@ -39,9 +44,26 @@ class Tree:
         return out
 
     def siblings(self, entry_id: UUID) -> tuple[list[EntryRecord], int]:
+        """Frères visibles ; l'entrée elle-même y figure même si elle est à la corbeille."""
         e = self.get(entry_id)
-        sibs = self.children.get(e.parent_id, [])
+        sibs = [
+            s
+            for s in self.all_children.get(e.parent_id, [])
+            if s.hidden_at is None or s.id == entry_id
+        ]
         return sibs, next(i for i, s in enumerate(sibs) if s.id == entry_id)
+
+    def subtree(self, entry_id: UUID) -> list[EntryRecord]:
+        """L'entrée et tous ses descendants, corbeille comprise."""
+        out = [self.get(entry_id)]
+        i = 0
+        while i < len(out):
+            out += self.all_children.get(out[i].id, [])
+            i += 1
+        return out
+
+    def is_hidden(self, entry_id: UUID) -> bool:
+        return any(e.hidden_at is not None for e in self.path(entry_id))
 
     def latest_descendant(self, entry_id: UUID) -> EntryRecord:
         """Descend en suivant l'enfant le plus récent à chaque niveau (D16)."""

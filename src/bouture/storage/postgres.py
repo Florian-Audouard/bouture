@@ -19,6 +19,7 @@ from sqlalchemy import BigInteger as SABigInteger
 from sqlalchemy import (
     Boolean,
     Column,
+    Connection,
     DateTime,
     Integer,
     MetaData,
@@ -71,6 +72,7 @@ sessions_t = Table(
     Column("title", Text),
     Column("metadata", JSONB),
     Column("model_override", Text),
+    Column("model_settings", JSONB),
     Column("leaf_entry_id", SAUuid),
     Column("object_id", SAUuid),
     Column("cloned_from_session_id", SAUuid),
@@ -122,6 +124,10 @@ entries_t = Table(
     Column("turn_id", SAUuid),
     Column("usage", JSONB),
     Column("created_at", _TS),
+    Column("label", Text),
+    Column("hidden_at", _TS),
+    Column("metadata", JSONB),
+    Column("derived_from", SAUuid),
 )
 turns_t = Table(
     "turns",
@@ -172,6 +178,14 @@ child_results_t = Table(
 )
 
 
+def _state_used() -> Any:
+    """Le snapshot est référencé par une entrée ou une publication."""
+    s = states_t.c
+    used_e = select(entries_t.c.id).where(entries_t.c.state_id == s.id).exists()
+    used_p = select(publications_t.c.object_id).where(publications_t.c.state_id == s.id).exists()
+    return or_(used_e, used_p)
+
+
 def _row_to[T](cls: type[T], row: Any) -> T:
     names = {f.name for f in fields(cls)}  # type: ignore[arg-type]
     return cls(**{k: v for k, v in row._mapping.items() if k in names})
@@ -188,6 +202,56 @@ def _migrations() -> list[tuple[int, str]]:
         if item.name.endswith(".sql"):
             out.append((int(item.name.split("_", 1)[0]), item.read_text(encoding="utf-8")))
     return sorted(out)
+
+
+SCHEMA_VERSION = _migrations()[-1][0]
+"""Version de schéma attendue par cette version de bouture."""
+
+_LOCK_ID = 7342981120
+
+
+def schema_version(connection: Connection) -> int:
+    """Version de schéma appliquée (0 si bouture n'a jamais été installé). Lecture seule."""
+    reg = connection.execute(text(f"SELECT to_regclass('{SCHEMA}.schema_version')")).scalar()
+    if reg is None:
+        return 0
+    return connection.execute(
+        text(f"SELECT coalesce(max(version), 0) FROM {SCHEMA}.schema_version")
+    ).scalar_one()
+
+
+def apply_migrations(connection: Connection, target: int | None = None) -> int:
+    """Applique les migrations bouture manquantes jusqu'à ``target`` (défaut : la dernière).
+
+    Connexion **synchrone** dans une transaction ouverte : celle d'Alembic (``op.get_bind()``)
+    ou celle que passe ``AsyncConnection.run_sync``. Idempotent, sérialisé par verrou
+    consultatif. Renvoie la version atteinte. Pas de retour arrière (D103).
+    """
+    migrations = _migrations()
+    goal = migrations[-1][0] if target is None else target
+    connection.execute(text(f"SELECT pg_advisory_xact_lock({_LOCK_ID})"))
+    current = schema_version(connection)
+    if current >= goal:
+        return current
+    connection.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
+    connection.execute(
+        text(
+            f"CREATE TABLE IF NOT EXISTS {SCHEMA}.schema_version ("
+            "version int PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+        )
+    )
+    for version, sql in migrations:
+        if version <= current or version > goal:
+            continue
+        for statement in (s.strip() for s in sql.split(";")):
+            if statement:
+                connection.exec_driver_sql(statement)
+        connection.execute(
+            text(f"INSERT INTO {SCHEMA}.schema_version (version) VALUES (:v)"), {"v": version}
+        )
+        log.info("bouture: migration %s appliquée", version)
+        current = version
+    return current
 
 
 class PostgresStorage:
@@ -221,37 +285,16 @@ class PostgresStorage:
                     await tx.session_obj.close()
 
     async def setup(self, *, auto_migrate: bool = True) -> None:
-        migrations = _migrations()
-        target = migrations[-1][0]
+        """``auto_migrate=False`` : vérification en lecture seule, ``SchemaOutdated`` si en retard."""
         async with self.engine.begin() as conn:
-            await conn.execute(text("SELECT pg_advisory_xact_lock(7342981120)"))
-            await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
-            await conn.execute(
-                text(
-                    f"CREATE TABLE IF NOT EXISTS {SCHEMA}.schema_version ("
-                    "version int PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
-                )
-            )
-            current = (
-                await conn.execute(
-                    text(f"SELECT coalesce(max(version), 0) FROM {SCHEMA}.schema_version")
-                )
-            ).scalar_one()
-            if current >= target:
+            if auto_migrate:
+                await conn.run_sync(apply_migrations)
                 return
-            if not auto_migrate:
-                raise SchemaOutdated(f"schéma bouture en version {current}, attendu {target}")
-            for version, sql in migrations:
-                if version <= current:
-                    continue
-                for statement in (s.strip() for s in sql.split(";")):
-                    if statement:
-                        await conn.exec_driver_sql(statement)
-                await conn.execute(
-                    text(f"INSERT INTO {SCHEMA}.schema_version (version) VALUES (:v)"),
-                    {"v": version},
+            current = await conn.run_sync(schema_version)
+            if current < SCHEMA_VERSION:
+                raise SchemaOutdated(
+                    f"schéma bouture en version {current}, attendu {SCHEMA_VERSION}"
                 )
-                log.info("bouture: migration %s appliquée", version)
 
     async def listen(
         self, on_events: EventsCallback, on_cancel: CancelCallback
@@ -350,6 +393,8 @@ class _PgTx:
         archived: bool,
         limit: int,
         before: tuple[datetime, UUID] | None,
+        object_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> list[SessionRecord]:
         c = sessions_t.c
         conds = [
@@ -362,6 +407,10 @@ class _PgTx:
             conds.append(c.origin_session_id == origin_session_id)
         if before is not None:
             conds.append(tuple_(c.updated_at, c.id) < tuple_(*before))
+        if object_id is not None:
+            conds.append(c.object_id == object_id)
+        if metadata is not None:
+            conds.append(c.metadata.contains(metadata))
         stmt = (
             select(sessions_t)
             .where(and_(*conds))
@@ -396,6 +445,12 @@ class _PgTx:
         rows = await self._all(select(states_t).where(states_t.c.id.in_(list(set(ids)))))
         return {r.id: _row_to(StateRecord, r) for r in rows}
 
+    async def delete_unused_states(self, ids: Sequence[UUID]) -> None:
+        if ids:
+            await self.conn.execute(
+                delete(states_t).where(states_t.c.id.in_(list(set(ids))), ~_state_used())
+            )
+
     # entrées --------------------------------------------------------------------------
     async def insert_entries(self, recs: Sequence[EntryRecord]) -> None:
         for r in recs:  # ordre parent → enfant requis par la FK
@@ -403,13 +458,20 @@ class _PgTx:
 
     async def get_entries(self, session_id: UUID) -> list[EntryRecord]:
         stmt = (
-            select(entries_t).where(entries_t.c.session_id == session_id).order_by(entries_t.c.id)
+            select(entries_t)
+            .where(entries_t.c.session_id == session_id)
+            .order_by(entries_t.c.created_at, entries_t.c.id)
         )
         return [_row_to(EntryRecord, r) for r in await self._all(stmt)]
 
     async def get_entry(self, entry_id: UUID) -> EntryRecord | None:
         rows = await self._all(select(entries_t).where(entries_t.c.id == entry_id))
         return _row_to(EntryRecord, rows[0]) if rows else None
+
+    async def update_entry(self, entry_id: UUID, **fields_: Any) -> None:
+        await self.conn.execute(
+            update(entries_t).where(entries_t.c.id == entry_id).values(**fields_)
+        )
 
     # tours ----------------------------------------------------------------------------
     async def insert_turn(self, rec: TurnRecord) -> None:
@@ -494,12 +556,7 @@ class _PgTx:
         ids = list(ids)
         await self.conn.execute(delete(events_t).where(events_t.c.session_id.in_(ids)))
         await self.conn.execute(delete(sessions_t).where(sessions_t.c.id.in_(ids)))
-        s = states_t.c
-        used_e = select(entries_t.c.id).where(entries_t.c.state_id == s.id).exists()
-        used_p = (
-            select(publications_t.c.object_id).where(publications_t.c.state_id == s.id).exists()
-        )
-        await self.conn.execute(delete(states_t).where(~or_(used_e, used_p)))
+        await self.conn.execute(delete(states_t).where(~_state_used()))
 
     # notifications --------------------------------------------------------------------
     def notify_events(self, session_id: UUID) -> None:

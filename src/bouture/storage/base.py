@@ -24,6 +24,7 @@ class SessionRecord:
     title: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     model_override: str | None = None
+    model_settings: dict[str, Any] = field(default_factory=dict)
     leaf_entry_id: UUID | None = None
     object_id: UUID | None = None
     cloned_from_session_id: UUID | None = None
@@ -73,6 +74,10 @@ class EntryRecord:
     interrupted: bool = False
     turn_id: UUID | None = None
     usage: dict[str, Any] | None = None
+    label: str | None = None
+    hidden_at: datetime | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    derived_from: UUID | None = None
 
 
 @dataclass(slots=True)
@@ -154,7 +159,12 @@ class StorageTx(Protocol):
         archived: bool,
         limit: int,
         before: tuple[datetime, UUID] | None,
-    ) -> list[SessionRecord]: ...
+        object_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[SessionRecord]:
+        """``metadata`` filtre par inclusion JSON (``@>``) : chaque clé donnée doit correspondre."""
+        ...
+
     async def sessions_of_owner(self, owner: str) -> list[UUID]: ...
 
     # inputs
@@ -164,11 +174,15 @@ class StorageTx(Protocol):
     # états
     async def insert_states(self, recs: Sequence[StateRecord]) -> None: ...
     async def get_states(self, ids: Sequence[UUID]) -> dict[UUID, StateRecord]: ...
+    async def delete_unused_states(self, ids: Sequence[UUID]) -> None:
+        """Supprime ceux de ces snapshots qu'aucune entrée ni publication ne référence."""
+        ...
 
     # entrées
     async def insert_entries(self, recs: Sequence[EntryRecord]) -> None: ...
     async def get_entries(self, session_id: UUID) -> list[EntryRecord]: ...
     async def get_entry(self, entry_id: UUID) -> EntryRecord | None: ...
+    async def update_entry(self, entry_id: UUID, **fields: Any) -> None: ...
 
     # tours
     async def insert_turn(self, rec: TurnRecord) -> None: ...

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request
@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from ..agents import Agents
 from ..errors import (
     BoutureError,
+    InvalidSettings,
     InvalidTarget,
     NotAwaitingInput,
     NotFound,
@@ -26,9 +27,11 @@ from ..refs import Data, Ref
 from ..views import (
     EntryView,
     Event,
+    InputView,
     Page,
     PublicationInfo,
     PublishedRefView,
+    RequestPreview,
     SessionInfo,
     Siblings,
     TurnHandle,
@@ -44,6 +47,7 @@ STATUS: dict[type[BoutureError], int] = {
     NotAwaitingInput: 409,
     StateValidationError: 422,
     ResolveError: 422,
+    InvalidSettings: 422,
 }
 
 
@@ -79,16 +83,49 @@ class CreateSessionBody(BaseModel):
     title: str | None = None
     metadata: dict[str, Any] = {}
     model: str | None = None
+    model_settings: dict[str, Any] = {}
 
 
 class PatchSessionBody(BaseModel):
     title: str | None = None
     metadata: dict[str, Any] | None = None
     model: str | None = None
+    model_settings: dict[str, Any] | None = None
 
 
 class CloneBody(BaseModel):
     title: str | None = None
+    entry_id: UUID | None = None
+
+
+class PreviewBody(BaseModel):
+    content: str | list[dict[str, Any]] | None = None
+
+
+class AppendBody(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str | list[dict[str, Any]]
+    parent_entry_id: UUID | None = None
+
+
+class EditEntryBody(BaseModel):
+    content: str | list[dict[str, Any]]
+
+
+class LabelBody(BaseModel):
+    label: str | None
+
+
+class EntryMetadataBody(BaseModel):
+    metadata: dict[str, Any]
+
+
+class InputsBody(BaseModel):
+    inputs: dict[str, InputBody]
+
+
+class HiddenResponse(BaseModel):
+    entry_ids: list[UUID]
 
 
 class MessageBody(BaseModel):
@@ -106,6 +143,7 @@ class EntryBody(BaseModel):
 
 class StateBody(BaseModel):
     state: dict[str, Any]
+    amend: bool = False
 
 
 class StateResponse(BaseModel):
@@ -142,8 +180,13 @@ def turn_response(h: TurnHandle) -> StreamingResponse:
 
 
 # -- routeur -----------------------------------------------------------------------------
-def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
-    """Routeur prêt à monter. ``current_user`` est une dépendance FastAPI renvoyant l'owner."""
+def make_router(
+    agents: Agents[Any], current_user: CurrentUser, *, expose_prompt: bool = True
+) -> APIRouter:
+    """Routeur prêt à monter. ``current_user`` est une dépendance FastAPI renvoyant l'owner.
+
+    ``expose_prompt=False`` : ``/preview`` ne renvoie que modèle, réglages et estimation (D93).
+    """
     r = APIRouter(responses={404: {"description": "Introuvable"}, 409: {"description": "Conflit"}})
     User = Depends(current_user)
 
@@ -170,6 +213,7 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
             title=body.title,
             metadata=body.metadata,
             model=body.model,
+            model_settings=body.model_settings,
         )
 
     @r.get("/sessions", response_model=Page[SessionInfo])
@@ -180,8 +224,22 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
         archived: bool = False,
         limit: int = 50,
         cursor: str | None = None,
+        object_id: UUID | None = None,
+        metadata: str | None = None,
         owner: str = User,
-    ) -> Page[SessionInfo]:
+    ) -> Page[SessionInfo] | JSONResponse:
+        """``metadata`` : objet JSON, sessions dont les métadonnées le contiennent (D102)."""
+        filt: dict[str, Any] | None = None
+        if metadata is not None:
+            try:
+                filt = json.loads(metadata)
+            except ValueError:
+                filt = None
+            if not isinstance(filt, dict):
+                return JSONResponse(
+                    {"error": "InvalidQuery", "message": "metadata : objet JSON attendu"},
+                    status_code=422,
+                )
         return await agents.list_sessions(
             owner,
             kind=kind,
@@ -189,6 +247,8 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
             archived=archived,
             limit=min(max(limit, 1), 200),
             cursor=cursor,
+            object_id=object_id,
+            metadata=filt,
         )
 
     @r.get("/sessions/{session_id}", response_model=SessionInfo)
@@ -209,7 +269,18 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
             info = await agents.update_metadata(session_id, owner, body.metadata or {})
         if "model" in fields:
             info = await agents.set_model(session_id, owner, body.model)
+        if "model_settings" in fields:
+            info = await agents.set_model_settings(session_id, owner, body.model_settings or {})
         return info
+
+    @r.post("/sessions/{session_id}/preview", response_model=RequestPreview)
+    @handled
+    async def preview(
+        session_id: UUID, body: PreviewBody | None = None, owner: str = User
+    ) -> RequestPreview:
+        return await agents.preview(
+            session_id, owner, body.content if body else None, expose_prompt=expose_prompt
+        )
 
     @r.post("/sessions/{session_id}/archive", response_model=SessionInfo)
     @handled
@@ -226,7 +297,12 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
     async def clone(
         session_id: UUID, body: CloneBody | None = None, owner: str = User
     ) -> SessionInfo:
-        return await agents.clone(session_id, owner, title=body.title if body else None)
+        return await agents.clone(
+            session_id,
+            owner,
+            title=body.title if body else None,
+            entry_id=body.entry_id if body else None,
+        )
 
     # tours (réponses SSE)
     @r.post("/sessions/{session_id}/messages")
@@ -276,8 +352,12 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
     # arbre
     @r.get("/sessions/{session_id}/tree", response_model=list[EntryView])
     @handled
-    async def tree(session_id: UUID, owner: str = User) -> list[EntryView]:
-        return await agents.get_tree(session_id, owner)
+    async def tree(
+        session_id: UUID, include_hidden: bool = False, labeled: bool = False, owner: str = User
+    ) -> list[EntryView]:
+        return await agents.get_tree(
+            session_id, owner, include_hidden=include_hidden, labeled=labeled
+        )
 
     @r.get("/sessions/{session_id}/branch", response_model=list[EntryView])
     @handled
@@ -301,6 +381,60 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
     async def rollback(session_id: UUID, body: EntryBody, owner: str = User) -> SessionInfo:
         return await agents.rollback(session_id, owner, body.entry_id)
 
+    @r.post("/sessions/{session_id}/entries/{entry_id}/hide", response_model=HiddenResponse)
+    @handled
+    async def hide(session_id: UUID, entry_id: UUID, owner: str = User) -> HiddenResponse:
+        return HiddenResponse(entry_ids=await agents.hide_branch(session_id, owner, entry_id))
+
+    @r.post("/sessions/{session_id}/entries/{entry_id}/restore", response_model=HiddenResponse)
+    @handled
+    async def restore(session_id: UUID, entry_id: UUID, owner: str = User) -> HiddenResponse:
+        return HiddenResponse(entry_ids=await agents.restore_branch(session_id, owner, entry_id))
+
+    # entrées hors tour
+    @r.post("/sessions/{session_id}/entries", status_code=201, response_model=EntryView)
+    @handled
+    async def append(session_id: UUID, body: AppendBody, owner: str = User) -> EntryView:
+        return await agents.append_message(
+            session_id, owner, body.role, body.content, parent_entry_id=body.parent_entry_id
+        )
+
+    @r.patch("/sessions/{session_id}/entries/{entry_id}", response_model=EntryView)
+    @handled
+    async def edit_entry(
+        session_id: UUID, entry_id: UUID, body: EditEntryBody, owner: str = User
+    ) -> EntryView:
+        return await agents.edit_entry(session_id, owner, entry_id, body.content)
+
+    @r.put("/sessions/{session_id}/entries/{entry_id}/label", response_model=EntryView)
+    @handled
+    async def label(
+        session_id: UUID, entry_id: UUID, body: LabelBody, owner: str = User
+    ) -> EntryView:
+        return await agents.label_entry(session_id, owner, entry_id, body.label)
+
+    @r.patch("/sessions/{session_id}/entries/{entry_id}/metadata", response_model=EntryView)
+    @handled
+    async def entry_metadata(
+        session_id: UUID, entry_id: UUID, body: EntryMetadataBody, owner: str = User
+    ) -> EntryView:
+        return await agents.set_entry_metadata(session_id, owner, entry_id, body.metadata)
+
+    # inputs
+    @r.get("/sessions/{session_id}/inputs", response_model=dict[str, InputView])
+    @handled
+    async def get_inputs(
+        session_id: UUID, entry_id: UUID | None = None, owner: str = User
+    ) -> dict[str, InputView]:
+        return await agents.get_inputs(session_id, owner, entry_id=entry_id)
+
+    @r.patch("/sessions/{session_id}/inputs", response_model=EntryView)
+    @handled
+    async def update_inputs(session_id: UUID, body: InputsBody, owner: str = User) -> EntryView:
+        return await agents.update_inputs(
+            session_id, owner, {k: v.to_input() for k, v in body.inputs.items()}
+        )
+
     # état
     @r.get("/sessions/{session_id}/state", response_model=StateResponse)
     @handled
@@ -316,7 +450,7 @@ def make_router(agents: Agents[Any], current_user: CurrentUser) -> APIRouter:
     @r.put("/sessions/{session_id}/state", response_model=EntryView)
     @handled
     async def edit_state(session_id: UUID, body: StateBody, owner: str = User) -> EntryView:
-        return await agents.edit_state(session_id, owner, body.state)
+        return await agents.edit_state(session_id, owner, body.state, amend=body.amend)
 
     # publication
     @r.post("/sessions/{session_id}/publish", response_model=PublishedRefView)

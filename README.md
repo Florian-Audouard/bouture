@@ -80,8 +80,9 @@ rattacher (autre onglet, après F5) : `agents.subscribe(session_id, owner, after
 dépendances applicatives passées à `Agents(deps=…)` et reçues dans `ctx.deps`.
 
 **Session** — instance d'un kind appartenant à un `owner`. C'est un arbre d'entrées
-(`root`, `user`, `assistant`, `tool_result`, `state_edit`, `child_result`, `summary`) avec un
-pointeur de feuille. Rien n'est jamais supprimé : on déplace la feuille ou on crée une branche.
+(`root`, `user`, `assistant`, `tool_result`, `state_edit`, `child_result`, `input_update`,
+`summary`) avec un pointeur de feuille. Rien n'est jamais supprimé : on déplace la feuille, on
+crée une branche ou on met une branche à la corbeille.
 Toutes les méthodes prennent `owner` ; la session d'un autre propriétaire donne `NotFound`.
 
 **État** — snapshot enregistré à chaque changement, réinjecté dans le contexte à chaque tour.
@@ -123,10 +124,14 @@ timeout=…)`, `ctx.emit(name, data)` (événement `custom`), `ToolFatal` pour a
 | `rollback(sid, owner, entry_id)` | déplace la feuille sur un checkpoint (conversation + état) |
 | `switch_branch(sid, owner, entry_id)` | bascule sur une autre branche |
 | `siblings(sid, owner, entry_id)` | variantes d'une entrée (pour « < 2/3 > ») |
-| `clone(sid, owner)` | nouvelle session avec la branche active seulement |
-| `edit_state(sid, owner, state)` | édition manuelle → entrée `state_edit` (le LLM en est informé) |
+| `clone(sid, owner, entry_id=None)` | nouvelle session avec un seul chemin (la branche active par défaut) |
+| `edit_state(sid, owner, state, amend=False)` | édition manuelle → entrée `state_edit` (le LLM en est informé) ; `amend=True` pour la sauvegarde automatique |
+| `append_message(sid, owner, role, content)` | message posé sans appel au modèle (accueil, note) |
+| `edit_entry(sid, owner, entry_id, content)` | corrige un message sans régénérer ; l'original reste en frère |
+| `label_entry(sid, owner, entry_id, label)` | nomme un checkpoint (point de sauvegarde) |
+| `hide_branch` · `restore_branch` | corbeille d'une branche (hors chemin actif) |
 | `stop(sid, owner)` | arrête le tour en cours ; le texte partiel est conservé |
-| `get_tree` · `get_branch` · `get_state(entry_id=…)` | lecture |
+| `get_tree(include_hidden=, labeled=)` · `get_branch` · `get_state(entry_id=…)` | lecture |
 
 ## Publication, inputs, sessions enfants
 
@@ -151,12 +156,71 @@ s = await agents.create_session("character", owner, inputs={"world": Ref("world"
   publication, `@definition.child_handler("handler")` applique le résultat à l'état du parent
   (entrée `child_result`).
 
+## Intégration dans une application
+
+Ce qui sert quand bouture remplace l'historique d'une application existante (D92–D105) :
+
+```python
+# Clé de l'utilisateur fournie à chaque appel, jamais stockée.
+async def credentials(request: ModelRequest) -> dict[str, Any]:
+    return {"api_key": await vault.key_for(request.context.owner)}
+
+
+agents = Agents(storage=storage, model_client=LiteLLMClient(credentials=credentials))
+s = await agents.create_session("character", owner, model_settings={"temperature": 0.9})
+
+
+@character.initial_messages  # message d'accueil, sans appel au modèle
+async def _(ctx: InitContext[Char, Deps]) -> list[tuple[str, Any]]:
+    return [("assistant", "Bonjour, voyageur.")]
+
+
+@character.on_entries  # lier les entrées du tour à des objets du projet, dans le commit
+async def _(ctx: EntriesContext[Deps], entries: list[EntryView]) -> dict[UUID, dict]:
+    return {e.id: {"app_message_id": ...} for e in entries if e.type == "assistant"}
+```
+
+- **Aperçu** : `await agents.preview(sid, owner, "message à venir")` renvoie le modèle, les
+  réglages, l'estimation de tokens et de coût, et le prompt exact, sans lancer de tour.
+- **Réglages par session** : seuls ceux de `AgentDefinition(overridable_settings=…)` sont
+  acceptés (échantillonnage par défaut) ; toute autre clé lève `InvalidSettings`.
+- **Références** : `update_inputs(sid, owner, {"world": Ref(...)})` change un input à partir
+  de ce point de la branche ; `get_inputs` lit les inputs effectifs.
+- **Retrouver une session** : `list_sessions(owner, object_id=…)` ou `metadata={"app": …}`.
+- **Métadonnées d'entrée** : `EntryView.metadata`, `set_entry_metadata` pour les modifier.
+- **Import** : `import_session(owner, kind, entries=[ImportedEntry(...)], publications=[...])`
+  reprend un historique existant (ids et dates conservés), en une transaction.
+- **Arguments d'outil en direct** : `AgentDefinition(stream_tool_args=True)` émet
+  `tool_call_delta`.
+
+**Migrations avec Alembic.** Une révision du projet applique le schéma de bouture, et
+l'application vérifie au démarrage sans rien modifier :
+
+```python
+# alembic/versions/xxxx_bouture.py
+from alembic import op
+from bouture.storage.postgres import apply_migrations
+
+
+def upgrade() -> None:
+    apply_migrations(op.get_bind())  # idempotent ; ``target=`` pour figer une version
+
+
+# env.py : exclure le schéma de bouture de l'autogénération
+def include_name(name, type_, parent_names):
+    return not (type_ == "schema" and name == "bouture")
+
+
+# démarrage : lecture seule, SchemaOutdated si une révision manque
+await storage.setup(auto_migrate=False)
+```
+
 ## Événements
 
 Chaque événement : `{id, session_id, turn_id, type, data, ts}`. Types : `turn_start`,
-`user_message`, `message_start`, `text_delta`, `reasoning_delta`, `tool_call`, `message_end`,
-`tool_result`, `state_changed` (JSON Patch), `ask_user`, `child_spawned`, `child_result_applied`,
-`custom`, `turn_end`. `turn_end.reason` ∈ `completed | awaiting_input | interrupted | error |
+`user_message`, `message_start`, `text_delta`, `reasoning_delta`, `tool_call_delta` (opt-in),
+`tool_call`, `message_end`, `tool_result`, `state_changed` (JSON Patch), `ask_user`,
+`child_spawned`, `child_result_applied`, `entry_metadata`, `custom`, `turn_end`. `turn_end.reason` ∈ `completed | awaiting_input | interrupted | error |
 max_steps | crashed | server_shutdown`. Détails : [PROPOSITION.md §3](PROPOSITION.md).
 
 ## Routes FastAPI
@@ -175,8 +239,10 @@ app.include_router(make_router(agents, current_user), prefix="/agents")
 Les routes vérifient l'appartenance via `owner` et ne contiennent aucune logique. Les tours
 répondent en SSE (en-tête `X-Turn-Id`) ; `GET /sessions/{id}/events` accepte `Last-Event-ID`.
 Erreurs : 404 (`NotFound`, `UnknownKind`), 409 (`SessionBusy`, `InvalidTarget`,
-`NotAwaitingInput`), 422 (`StateValidationError`, `ResolveError`). La purge RGPD
-(`purge_session`, `purge_owner`) n'est pas exposée.
+`NotAwaitingInput`), 422 (`StateValidationError`, `ResolveError`, `InvalidSettings`). La purge
+RGPD (`purge_session`, `purge_owner`) n'est pas exposée. `make_router(..., expose_prompt=False)`
+masque le prompt dans `POST /sessions/{id}/preview`. Liste complète :
+[PROPOSITION.md §4](PROPOSITION.md).
 
 ## Exemple
 

@@ -42,6 +42,23 @@ _TABLES = (
 )
 
 
+def _contains(doc: Any, sub: Any) -> bool:
+    """Équivalent mémoire de l'opérateur JSONB ``@>``."""
+    if isinstance(sub, dict):
+        if not isinstance(doc, dict):
+            return False
+        d: dict[str, Any] = doc  # pyright: ignore[reportUnknownVariableType]
+        s: dict[str, Any] = sub  # pyright: ignore[reportUnknownVariableType]
+        return all(k in d and _contains(d[k], v) for k, v in s.items())
+    if isinstance(sub, list):
+        if not isinstance(doc, list):
+            return False
+        dl: list[Any] = doc  # pyright: ignore[reportUnknownVariableType]
+        sl: list[Any] = sub  # pyright: ignore[reportUnknownVariableType]
+        return all(any(_contains(x, v) for x in dl) for v in sl)
+    return doc == sub
+
+
 class MemoryStorage:
     def __init__(self) -> None:
         self.sessions: dict[UUID, SessionRecord] = {}
@@ -129,6 +146,8 @@ class _MemoryTx:
         archived: bool,
         limit: int,
         before: tuple[datetime, UUID] | None,
+        object_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> list[SessionRecord]:
         rows = [
             s
@@ -138,6 +157,8 @@ class _MemoryTx:
             and (origin_session_id is None or s.origin_session_id == origin_session_id)
             and ((s.archived_at is not None) == archived)
             and (before is None or (s.updated_at, s.id) < before)
+            and (object_id is None or s.object_id == object_id)
+            and (metadata is None or _contains(s.metadata, metadata))
         ]
         rows.sort(key=lambda s: (s.updated_at, s.id), reverse=True)
         return [copy.deepcopy(s) for s in rows[:limit]]
@@ -161,6 +182,14 @@ class _MemoryTx:
     async def get_states(self, ids: Sequence[UUID]) -> dict[UUID, StateRecord]:
         return {i: copy.deepcopy(self._s.states[i]) for i in ids if i in self._s.states}
 
+    async def delete_unused_states(self, ids: Sequence[UUID]) -> None:
+        s = self._s
+        used = {e.state_id for e in s.entries.values()} | {
+            p.state_id for p in s.publications.values()
+        }
+        for i in set(ids) - used:
+            s.states.pop(i, None)
+
     # entrées --------------------------------------------------------------------------
     async def insert_entries(self, recs: Sequence[EntryRecord]) -> None:
         for r in recs:
@@ -168,12 +197,15 @@ class _MemoryTx:
 
     async def get_entries(self, session_id: UUID) -> list[EntryRecord]:
         rows = [copy.deepcopy(e) for e in self._s.entries.values() if e.session_id == session_id]
-        rows.sort(key=lambda e: e.id)
+        rows.sort(key=lambda e: (e.created_at, e.id))
         return rows
 
     async def get_entry(self, entry_id: UUID) -> EntryRecord | None:
         e = self._s.entries.get(entry_id)
         return copy.deepcopy(e) if e else None
+
+    async def update_entry(self, entry_id: UUID, **fields: Any) -> None:
+        self._s.entries[entry_id] = replace(self._s.entries[entry_id], **copy.deepcopy(fields))
 
     # tours ----------------------------------------------------------------------------
     async def insert_turn(self, rec: TurnRecord) -> None:
