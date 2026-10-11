@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import inspect
 import typing
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, overload
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, create_model
 
@@ -16,12 +17,14 @@ if TYPE_CHECKING:
     from .context import (
         BuildContext,
         ChildResultContext,
+        EntriesContext,
+        InitContext,
         PublishContext,
         TurnEndContext,
     )
     from .models.base import ModelRequest
     from .refs import PublishedRef
-    from .views import TurnResult
+    from .views import EntryView, TurnResult
 
 
 @dataclass
@@ -36,6 +39,20 @@ class AskUser:
 ToolFn = Callable[..., Awaitable[Any]]
 AnswerFn = Callable[..., Awaitable[Any]]
 StateMigration = Callable[[dict[str, Any]], dict[str, Any]]
+
+DEFAULT_OVERRIDABLE_SETTINGS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "top_k",
+        "frequency_penalty",
+        "presence_penalty",
+        "max_tokens",
+        "seed",
+        "stop",
+    }
+)
+"""Réglages qu'une session peut surcharger par défaut (D92) : échantillonnage uniquement."""
 
 
 class Tool:
@@ -98,6 +115,8 @@ class AgentDefinition[S, D]:
         inputs: Mapping[str, str] | None = None,
         max_steps: int = 25,
         tool_timeout: float = 120.0,
+        overridable_settings: Collection[str] | None = None,
+        stream_tool_args: bool = False,
     ) -> None:
         if state_type is not None and not (
             isinstance(state_type, type)  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -115,6 +134,10 @@ class AgentDefinition[S, D]:
         self.inputs = dict(inputs or {})
         self.max_steps = max_steps
         self.tool_timeout = tool_timeout
+        self.overridable_settings = frozenset(
+            DEFAULT_OVERRIDABLE_SETTINGS if overridable_settings is None else overridable_settings
+        )
+        self.stream_tool_args = stream_tool_args
         self.tools: dict[str, Tool] = {}
         self.publish_hook: (
             Callable[[PublishContext[D], PublishedRef, S], Awaitable[None]] | None
@@ -123,6 +146,13 @@ class AgentDefinition[S, D]:
         self.state_renderer: Callable[[S], str] | None = None
         self.context_builder: Callable[[BuildContext[S, D]], Awaitable[ModelRequest]] | None = None
         self.turn_end_hook: Callable[[TurnEndContext[D], TurnResult], Awaitable[None]] | None = None
+        self.initial_messages_hook: (
+            Callable[[InitContext[S, D]], Awaitable[Sequence[tuple[str, Any]]]] | None
+        ) = None
+        self.entries_hook: (
+            Callable[[EntriesContext[D], list[EntryView]], Awaitable[Mapping[UUID, dict[str, Any]]]]
+            | None
+        ) = None
 
     # -- état initial ----------------------------------------------------------------
     def make_initial_state(self, inputs: Mapping[str, Any]) -> S | None:
@@ -194,4 +224,21 @@ class AgentDefinition[S, D]:
         self, fn: Callable[[TurnEndContext[D], TurnResult], Awaitable[None]]
     ) -> Callable[[TurnEndContext[D], TurnResult], Awaitable[None]]:
         self.turn_end_hook = fn
+        return fn
+
+    def initial_messages(
+        self, fn: Callable[[InitContext[S, D]], Awaitable[Sequence[tuple[str, Any]]]]
+    ) -> Callable[[InitContext[S, D]], Awaitable[Sequence[tuple[str, Any]]]]:
+        """Messages posés à la création, sans appel LLM : ``[("assistant", "Bonjour…")]`` (D96)."""
+        self.initial_messages_hook = fn
+        return fn
+
+    def on_entries(
+        self,
+        fn: Callable[
+            [EntriesContext[D], list[EntryView]], Awaitable[Mapping[UUID, dict[str, Any]]]
+        ],
+    ) -> Callable[[EntriesContext[D], list[EntryView]], Awaitable[Mapping[UUID, dict[str, Any]]]]:
+        """Métadonnées des entrées d'un tour, écrites dans la transaction du commit (D101)."""
+        self.entries_hook = fn
         return fn

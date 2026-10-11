@@ -149,12 +149,14 @@ Toutes prennent `owner` ; session d'un autre propriétaire → `NotFound` (D61).
 
 | Méthode | Retour | Notes |
 |---|---|---|
-| `create_session(kind, owner, *, inputs=None, title=None, metadata=None, model=None)` | `SessionInfo` | crée `root` + snapshot initial |
+| `create_session(kind, owner, *, inputs=None, title=None, metadata=None, model=None, model_settings=None)` | `SessionInfo` | crée `root` + snapshot initial, puis les messages de `initial_messages` (D96) |
 | `get_session(id, owner)` | `SessionInfo` | inclut `status`, `pending`, `leaf_entry_id` |
-| `list_sessions(owner, *, kind=None, origin_session_id=None, archived=False, limit=50, cursor=None)` | `Page[SessionInfo]` | tri `updated_at desc` |
+| `list_sessions(owner, *, kind=None, origin_session_id=None, archived=False, limit=50, cursor=None, object_id=None, metadata=None)` | `Page[SessionInfo]` | tri `updated_at desc` ; `metadata` = inclusion JSON (D102) |
 | `rename(id, owner, title)` / `update_metadata(id, owner, metadata)` / `set_model(id, owner, model\|None)` | `SessionInfo` | |
+| `set_model_settings(id, owner, settings)` | `SessionInfo` | liste blanche `overridable_settings`, sinon `InvalidSettings` (D92) |
 | `archive(id, owner)` / `unarchive(id, owner)` | `SessionInfo` | |
-| `clone(id, owner, *, title=None)` | `SessionInfo` | branche active seulement (D17) |
+| `clone(id, owner, *, title=None, entry_id=None)` | `SessionInfo` | un seul chemin (D17, D98) |
+| `import_session(owner, kind, *, entries, leaf_id=None, publications=(), …)` | `SessionInfo` | import d'historique, ids et dates conservés (D104) |
 | **Tours** | | |
 | `send_message(id, owner, content)` | `TurnHandle` | `content: str \| list[ContentBlock]` |
 | `answer(id, owner, answer)` | `TurnHandle` | réponse à `pending[0]` |
@@ -163,14 +165,25 @@ Toutes prennent `owner` ; session d'un autre propriétaire → `NotFound` (D61).
 | `stop(id, owner)` | `None` | idempotent |
 | `subscribe(id, owner, *, after=None)` | `AsyncIterator[Event]` | rejoue puis suit en direct (D24) |
 | **Arbre** | | |
-| `get_tree(id, owner)` | `list[EntryView]` | arbre complet, sans contenu d'état |
+| `get_tree(id, owner, *, include_hidden=False, labeled=False)` | `list[EntryView]` | arbre complet, sans contenu d'état ni corbeille |
 | `get_branch(id, owner, *, entry_id=None)` | `list[EntryView]` | root → entry (défaut : feuille) |
 | `siblings(id, owner, entry_id)` | `Siblings(entries, index)` | |
 | `switch_branch(id, owner, entry_id)` | `SessionInfo` | D16 |
 | `rollback(id, owner, entry_id)` | `SessionInfo` | checkpoint requis sinon `InvalidTarget` |
+| `append_message(id, owner, role, content, *, parent_entry_id=None)` | `EntryView` | sans appel LLM, checkpoint (D96) |
+| `edit_entry(id, owner, entry_id, content)` | `EntryView` | copie sœur `derived_from`, suite recopiée (D97) |
+| `label_entry(id, owner, entry_id, label)` | `EntryView` | point de sauvegarde nommé (D95) |
+| `set_entry_metadata(id, owner, entry_id, metadata)` | `EntryView` | fusion, `None` supprime (D101) |
+| `hide_branch(id, owner, entry_id)` / `restore_branch(…)` | `list[UUID]` | corbeille (D100) |
+| **Inputs** | | |
+| `update_inputs(id, owner, inputs)` | `EntryView` | entrée `input_update` (D99) |
+| `get_inputs(id, owner, *, entry_id=None)` | `dict[str, InputView]` | inputs effectifs sur la branche |
+| **Aperçu** | | |
+| `preview_request(id, owner, content=None)` | `ModelRequest` | sans tour ni écriture (D93) |
+| `preview(id, owner, content=None, *, expose_prompt=True)` | `RequestPreview` | + `estimate` du client |
 | **État** | | |
 | `get_state(id, owner, *, entry_id=None)` | `StateView(state, state_version, entry_id)` | migré à la lecture |
-| `edit_state(id, owner, state)` | `EntryView` | D43 |
+| `edit_state(id, owner, state, *, amend=False)` | `EntryView` | D43 ; `amend` réécrit le dernier `state_edit` (D94) |
 | **Publication** | | |
 | `publish(id, owner)` | `PublishedRef(kind, object_id, version)` | D50–D53 |
 | `list_publications(owner, kind, object_id)` | `list[PublicationInfo]` | |
@@ -182,7 +195,12 @@ Toutes prennent `owner` ; session d'un autre propriétaire → `NotFound` (D61).
 
 **Erreurs** (`bouture.errors`) : `NotFound`, `SessionBusy`, `InvalidTarget`,
 `NotAwaitingInput`, `StateValidationError`, `StateVersionError`, `ResolveError`,
-`UnknownKind`, `SchemaOutdated`.
+`UnknownKind`, `SchemaOutdated`, `InvalidSettings`.
+
+**Crochets d'intégration** (D96, D101) : `@definition.initial_messages`
+(`InitContext` → `[(role, content)]`) et `@definition.on_entries`
+(`EntriesContext` avec `db`, entrées du tour → `{entry_id: metadata}`), ce dernier appelé dans
+la transaction du commit.
 
 ### 1.4 Format neutre des messages (D2)
 
@@ -195,7 +213,10 @@ ToolResult(tool_call_id, content: str | list[ContentBlock], is_error: bool)
 ```
 
 `ModelClient.stream(request: ModelRequest) -> AsyncIterator[ModelEvent]`, avec
-`ModelEvent = TextDelta | ReasoningDelta | ToolCallComplete | Usage | Done(stop_reason)`.
+`ModelEvent = TextDelta | ReasoningDelta | ToolCallDelta | ToolCallComplete | Usage | Done(stop_reason)`.
+`ModelRequest.context` (`CallContext(owner, session_id, kind, turn_id)`) identifie l'appel ;
+méthode optionnelle `estimate(request) -> Estimate(input_tokens, cost)` (D92, D93).
+`LiteLLMClient(credentials=async (request) -> dict)` fournit les identifiants à chaque appel.
 `FakeModelClient(script=[...])` pour les tests : réponses scriptées, y compris tool_calls et pauses artificielles.
 
 ### 1.5 Contexte par défaut (D21, D42, D56)
@@ -225,6 +246,7 @@ CREATE TABLE bouture.sessions (
   title               text,
   metadata            jsonb NOT NULL DEFAULT '{}',
   model_override      text,
+  model_settings      jsonb NOT NULL DEFAULT '{}',  -- réglages surchargés (D92)
   leaf_entry_id       uuid,                       -- FK différée vers entries
   object_id           uuid UNIQUE,                -- attribué à la 1re publication (D51)
   -- clone (D17)
@@ -247,6 +269,7 @@ CREATE TABLE bouture.sessions (
 );
 CREATE INDEX ON bouture.sessions (owner, kind, archived_at, updated_at DESC);
 CREATE INDEX ON bouture.sessions (origin_session_id);
+CREATE INDEX ON bouture.sessions USING gin (metadata jsonb_path_ops);  -- D102
 
 CREATE TABLE bouture.session_inputs (            -- immuables (D54)
   session_id   uuid NOT NULL REFERENCES bouture.sessions(id) ON DELETE CASCADE,
@@ -279,7 +302,11 @@ CREATE TABLE bouture.entries (
   interrupted   boolean NOT NULL DEFAULT false,
   turn_id       uuid,
   usage         jsonb,
-  created_at    timestamptz NOT NULL DEFAULT now()
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  label         text,                            -- point de sauvegarde nommé (D95)
+  hidden_at     timestamptz,                     -- corbeille (D100)
+  metadata      jsonb NOT NULL DEFAULT '{}',     -- données de l'application (D101)
+  derived_from  uuid                             -- original d'un message édité (D97)
 );
 CREATE INDEX ON bouture.entries (session_id, parent_id, created_at);
 
@@ -340,6 +367,9 @@ Notes :
   Un bail expiré repris déclenche d'abord la clôture `crashed` du tour précédent (D28).
 - Canaux `NOTIFY` : `bouture_events` (payload `session_id:event_id`) et `bouture_cancel` (payload `turn_id`).
 - L'arbre d'une session se charge en une requête (`WHERE session_id = $1`), la branche active se reconstruit en mémoire.
+- Migrations : `apply_migrations(connection, target=None)` (synchrone, idempotent) pour une
+  révision Alembic, `SCHEMA_VERSION` ; `setup(auto_migrate=False)` vérifie en lecture seule (D103).
+- `entries.type = 'input_update'` : `content = {"inputs": {name: {mode, kind, object_id, version, data, data_version}}}` (D99).
 
 ---
 
@@ -358,6 +388,7 @@ Enveloppe commune (une ligne SSE `id:` = `id`, `event:` = `type`, `data:` = JSON
 | `message_start` | `{entry_id, role: "assistant"}` | début d'un appel LLM (entry_id pré-attribué) |
 | `text_delta` | `{entry_id, text}` | texte (regroupé) |
 | `reasoning_delta` | `{entry_id, text}` | raisonnement, si le modèle en produit |
+| `tool_call_delta` | `{entry_id, index, tool_call_id, name, args_delta}` | arguments d'outil en cours, si `stream_tool_args` (D105) |
 | `tool_call` | `{entry_id, tool_call_id, name, args}` | appel d'outil complet |
 | `message_end` | `{entry_id, interrupted, usage}` | fin d'un appel LLM |
 | `tool_result` | `{entry_id, tool_call_id, name, is_error, content}` | après exécution d'un outil |
@@ -366,6 +397,7 @@ Enveloppe commune (une ligne SSE `id:` = `id`, `event:` = `type`, `data:` = JSON
 | `child_spawned` | `{session_id, kind}` | session enfant créée |
 | `child_result_applied` | `{entry_id, child_session_id, object_id, version}` | résultat d'enfant appliqué |
 | `custom` | `{name, data}` | `ctx.emit()` d'un outil |
+| `entry_metadata` | `{entries: {entry_id: metadata}}` | posé par `on_entries`, juste avant `turn_end` (D101) |
 | `turn_end` | `{reason, leaf_entry_id, usage, error?}` | toujours le dernier événement d'un tour |
 
 `reason` ∈ `completed | awaiting_input | interrupted | error | max_steps | crashed | server_shutdown`.
@@ -393,23 +425,31 @@ app.include_router(make_router(agents, current_user=get_current_user), prefix="/
 
 Aucune logique : chaque route = un appel au cœur avec `owner = current_user()`.
 Mapping des erreurs : `NotFound`→404, `SessionBusy`→409, `InvalidTarget`/`NotAwaitingInput`→409,
-`StateValidationError`/`ResolveError`→422, `UnknownKind`→404.
+`StateValidationError`/`ResolveError`/`InvalidSettings`→422, `UnknownKind`→404.
+`make_router(agents, current_user, expose_prompt=True)` : `False` masque le prompt de `/preview`.
 
 | Méthode | Chemin | Cœur |
 |---|---|---|
 | `POST` | `/sessions` | `create_session` |
-| `GET` | `/sessions?kind=&archived=&cursor=` | `list_sessions` |
-| `GET` / `PATCH` | `/sessions/{id}` | `get_session` / `rename`+`update_metadata`+`set_model` |
-| `POST` | `/sessions/{id}/archive` · `/unarchive` · `/clone` | … |
+| `GET` | `/sessions?kind=&archived=&cursor=&object_id=&metadata=<json>` | `list_sessions` |
+| `GET` / `PATCH` | `/sessions/{id}` | `get_session` / `rename`+`update_metadata`+`set_model`+`set_model_settings` |
+| `POST` | `/sessions/{id}/archive` · `/unarchive` · `/clone` (body `{title?, entry_id?}`) | … |
+| `POST` | `/sessions/{id}/preview` (body `{content?}`) | `preview` |
 | `POST` | `/sessions/{id}/messages` | `send_message` → **SSE** du tour (fermer = détacher) |
 | `POST` | `/sessions/{id}/answer` | `answer` → SSE |
 | `POST` | `/sessions/{id}/entries/{eid}/fork` | `fork` → SSE |
 | `POST` | `/sessions/{id}/entries/{eid}/regenerate` | `regenerate` → SSE |
 | `POST` | `/sessions/{id}/stop` | `stop` |
 | `GET` | `/sessions/{id}/events` (+ `Last-Event-ID`) | `subscribe` → SSE |
-| `GET` | `/sessions/{id}/tree` · `/branch?entry_id=` · `/entries/{eid}/siblings` | … |
+| `GET` | `/sessions/{id}/tree?include_hidden=&labeled=` · `/branch?entry_id=` · `/entries/{eid}/siblings` | … |
+| `POST` | `/sessions/{id}/entries` (body `{role, content, parent_entry_id?}`) | `append_message` |
+| `PATCH` | `/sessions/{id}/entries/{eid}` (body `{content}`) | `edit_entry` |
+| `PUT` | `/sessions/{id}/entries/{eid}/label` (body `{label}`) | `label_entry` |
+| `PATCH` | `/sessions/{id}/entries/{eid}/metadata` (body `{metadata}`) | `set_entry_metadata` |
+| `POST` | `/sessions/{id}/entries/{eid}/hide` · `/restore` | `hide_branch` / `restore_branch` |
+| `GET` / `PATCH` | `/sessions/{id}/inputs?entry_id=` (body `{inputs}`) | `get_inputs` / `update_inputs` |
 | `POST` | `/sessions/{id}/switch` · `/rollback` (body `{entry_id}`) | … |
-| `GET` / `PUT` | `/sessions/{id}/state?entry_id=` | `get_state` / `edit_state` |
+| `GET` / `PUT` | `/sessions/{id}/state?entry_id=` (body `{state, amend?}`) | `get_state` / `edit_state` |
 | `POST` | `/sessions/{id}/publish` | `publish` |
 | `GET` | `/publications/{kind}/{object_id}` | `list_publications` |
 
@@ -426,4 +466,11 @@ Mapping des erreurs : `NotFound`→404, `SessionBusy`→409, `InvalidTarget`/`No
   entre étapes) · déconnexion sans stop · bail expiré → `crashed` · publication + idempotence ·
   `on_publish` qui échoue → rollback · enfant + file d'attente · migration d'état ·
   isolation entre propriétaires · routes (TestClient).
+- Intégration (`tests/test_integration.py`, D92–D105) : réglages par session et contexte
+  d'appel · aperçu sans tour (identique à la requête réelle) · sauvegarde automatique amendée ·
+  points nommés · `initial_messages` / `append_message` · édition sans régénération · clone
+  depuis une entrée · `update_inputs` et rollback · corbeille · `on_entries` et métadonnées ·
+  recherche par objet / métadonnées · import · `tool_call_delta` opt-in. Routes associées,
+  `LiteLLMClient` (identifiants par appel, estimation) et migrations (`tests/test_migrations.py` :
+  vérification en lecture seule, idempotence).
 - Tests de conformité stockage sur mémoire **et** Postgres (sautés sans `BOUTURE_TEST_PG_URL`).

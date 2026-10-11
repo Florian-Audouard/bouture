@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..errors import ModelError
 from ..messages import Usage
-from .base import Done, ModelEvent, ModelRequest, TextDelta, ToolCallComplete, UsageReport
+from .base import (
+    Done,
+    Estimate,
+    ModelEvent,
+    ModelRequest,
+    TextDelta,
+    ToolCallComplete,
+    ToolCallDelta,
+    UsageReport,
+)
 
 
 @dataclass
@@ -18,6 +28,7 @@ class FakeReply:
 
     - ``text`` est streamé en morceaux de ``chunk`` caractères ;
     - ``tool_calls`` : liste de ``(nom, args)`` ;
+    - ``stream_args`` : les arguments des outils sont aussi streamés (``ToolCallDelta``) ;
     - ``hang`` : après le texte, attend indéfiniment (pour tester stop / crash) ;
     - ``error`` : lève une ``ModelError`` (``transient`` réessayable) avant tout token.
     """
@@ -25,6 +36,7 @@ class FakeReply:
     text: str = ""
     tool_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     chunk: int = 4
+    stream_args: bool = False
     delay: float = 0.0
     hang: bool = False
     error: ModelError | None = None
@@ -46,6 +58,11 @@ class FakeModelClient:
 
     def push(self, *replies: Script) -> None:
         self.script.extend(replies)
+
+    async def estimate(self, request: ModelRequest) -> Estimate:
+        """Grossière : un token pour quatre caractères de prompt."""
+        size = len(request.system) + sum(len(m.model_dump_json()) for m in request.messages)
+        return Estimate(input_tokens=size // 4)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         self.requests.append(request)
@@ -69,6 +86,17 @@ class FakeModelClient:
         if reply.hang:
             await asyncio.Event().wait()
         for n, (name, args) in enumerate(reply.tool_calls):
-            yield ToolCallComplete(id=f"call_{self._call}_{n}", name=name, args=args)
+            call_id = f"call_{self._call}_{n}"
+            if reply.stream_args:
+                raw = json.dumps(args)
+                for i in range(0, len(raw), reply.chunk):
+                    head = i == 0
+                    yield ToolCallDelta(
+                        n,
+                        call_id if head else None,
+                        name if head else None,
+                        raw[i : i + reply.chunk],
+                    )
+            yield ToolCallComplete(id=call_id, name=name, args=args)
         yield UsageReport(reply.usage)
         yield Done("tool_use" if reply.tool_calls else "end_turn")

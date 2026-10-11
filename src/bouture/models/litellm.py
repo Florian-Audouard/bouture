@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import aclosing
 from typing import Any
 
@@ -19,13 +19,17 @@ from ..messages import (
 )
 from .base import (
     Done,
+    Estimate,
     ModelEvent,
     ModelRequest,
     ReasoningDelta,
     TextDelta,
     ToolCallComplete,
+    ToolCallDelta,
     UsageReport,
 )
+
+Credentials = Callable[[ModelRequest], Awaitable[Mapping[str, Any]]]
 
 try:
     import litellm  # pyright: ignore[reportMissingImports]
@@ -50,14 +54,46 @@ class LiteLLMClient:
 
     ``api_keys`` est indexé par préfixe de fournisseur ; à défaut, LiteLLM lit les variables
     d'environnement standard.
+
+    ``credentials`` (D92) : ``async (ModelRequest) -> dict`` appelé à chaque appel, avec
+    ``request.context`` (owner, session, kind). Les clés renvoyées (``api_key``,
+    ``api_base``, ``extra_headers``…) sont passées à LiteLLM pour ce seul appel : rien n'est
+    stocké ni journalisé.
     """
 
-    def __init__(self, api_keys: dict[str, str] | None = None, **extra: Any) -> None:
+    def __init__(
+        self,
+        api_keys: dict[str, str] | None = None,
+        *,
+        credentials: Credentials | None = None,
+        **extra: Any,
+    ) -> None:
         self.api_keys = api_keys or {}
+        self.credentials = credentials
         self.extra = extra
 
     def _key(self, model: str) -> str | None:
         return self.api_keys.get(model.split("/", 1)[0])
+
+    async def estimate(self, request: ModelRequest) -> Estimate:
+        """Tokens d'entrée (tokenizer LiteLLM) et coût d'entrée si le modèle est tarifé (D93)."""
+        messages = to_openai_messages(request.system, request.messages)
+        try:
+            tokens = litellm.token_counter(
+                model=request.model,
+                messages=messages,
+                tools=_tools(request),  # pyright: ignore[reportArgumentType]
+            )
+        except Exception as exc:
+            raise ModelError(_safe(exc), code=type(exc).__name__) from exc
+        cost: float | None
+        try:
+            cost, _ = litellm.cost_per_token(
+                model=request.model, prompt_tokens=tokens, completion_tokens=0
+            )
+        except Exception:
+            cost = None  # modèle absent de la table de prix de LiteLLM
+        return Estimate(input_tokens=tokens, cost=cost)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         kwargs: dict[str, Any] = {
@@ -68,20 +104,17 @@ class LiteLLMClient:
             **self.extra,
             **request.settings,
         }
-        if request.tools:
-            kwargs["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    },
-                }
-                for t in request.tools
-            ]
+        if tools := _tools(request):
+            kwargs["tools"] = tools
         if key := self._key(request.model):
             kwargs["api_key"] = key
+        if self.credentials is not None:
+            try:
+                kwargs.update(await self.credentials(request))
+            except ModelError:
+                raise
+            except Exception as exc:
+                raise ModelError(_safe(exc), code="credentials_error") from exc
         try:
             response = await litellm.acompletion(**kwargs)
         except _TRANSIENT as exc:
@@ -116,6 +149,12 @@ class LiteLLMClient:
                             slot["name"] = tc.function.name
                         if tc.function and tc.function.arguments:
                             slot["args"] += tc.function.arguments
+                            yield ToolCallDelta(
+                                tc.index,
+                                tc.id or None,
+                                tc.function.name or None,
+                                tc.function.arguments,
+                            )
                     if choice.finish_reason:
                         finish = choice.finish_reason
         except _TRANSIENT as exc:
@@ -134,6 +173,18 @@ class LiteLLMClient:
                 args = {"_raw": slot["args"]}
             yield ToolCallComplete(id=slot["id"] or f"call_{index}", name=slot["name"], args=args)
         yield Done(finish)
+
+
+def _tools(request: ModelRequest) -> list[dict[str, Any]] | None:
+    if not request.tools:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {"name": t.name, "description": t.description, "parameters": t.parameters},
+        }
+        for t in request.tools
+    ]
 
 
 def _safe(exc: Exception) -> str:

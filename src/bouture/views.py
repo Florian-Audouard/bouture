@@ -9,7 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from .messages import Usage
+from .messages import Message, Usage
 from .storage.base import EntryRecord
 
 SessionStatus = Literal["idle", "running", "awaiting_input"]
@@ -32,6 +32,7 @@ class SessionInfo(BaseModel):
     title: str | None
     metadata: dict[str, Any]
     model: str
+    model_settings: dict[str, Any] = {}
     status: SessionStatus
     leaf_entry_id: UUID | None
     pending: list[PendingQuestion]
@@ -56,6 +57,10 @@ class EntryView(BaseModel):
     turn_id: UUID | None
     usage: dict[str, Any] | None
     created_at: datetime
+    label: str | None = None
+    metadata: dict[str, Any] = {}
+    hidden_at: datetime | None = None
+    derived_from: UUID | None = None
 
 
 def entry_view(rec: EntryRecord) -> EntryView:
@@ -70,7 +75,37 @@ def entry_view(rec: EntryRecord) -> EntryView:
         turn_id=rec.turn_id,
         usage=rec.usage,
         created_at=rec.created_at,
+        label=rec.label,
+        metadata=rec.metadata,
+        hidden_at=rec.hidden_at,
+        derived_from=rec.derived_from,
     )
+
+
+class InputView(BaseModel):
+    """Input effectif d'une session : ``Ref`` (``id``, ``version``) ou ``Data`` (``value``)."""
+
+    mode: Literal["ref", "data"]
+    kind: str
+    id: UUID | None = None
+    version: int | None = None
+    value: Any = None
+
+
+class RequestPreview(BaseModel):
+    """Ce que recevrait le modèle au prochain appel (D93).
+
+    ``system``, ``messages`` et ``tools`` valent ``None`` quand le prompt n'est pas exposé.
+    ``input_tokens`` / ``cost`` valent ``None`` si le client ne sait pas estimer.
+    """
+
+    model: str
+    settings: dict[str, Any]
+    input_tokens: int | None = None
+    cost: float | None = None
+    system: str | None = None
+    messages: list[Message] | None = None
+    tools: list[dict[str, Any]] | None = None
 
 
 class StateView(BaseModel):

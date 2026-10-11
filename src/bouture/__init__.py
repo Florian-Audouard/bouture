@@ -4,6 +4,8 @@ from .agents import Agents
 from .context import (
     BuildContext,
     ChildResultContext,
+    EntriesContext,
+    InitContext,
     PublishContext,
     PurgeContext,
     ResolveContext,
@@ -14,6 +16,7 @@ from .context import (
 from .definition import AgentDefinition, AskUser, Tool
 from .errors import (
     BoutureError,
+    InvalidSettings,
     InvalidTarget,
     ModelError,
     NotAwaitingInput,
@@ -26,6 +29,7 @@ from .errors import (
     ToolFatal,
     UnknownKind,
 )
+from .importing import ImportedEntry, ImportedPublication
 from .messages import (
     AssistantMessage,
     ImageBlock,
@@ -36,16 +40,27 @@ from .messages import (
     Usage,
     UserMessage,
 )
-from .models import FakeModelClient, FakeReply, ModelClient, ModelRequest, ToolSpec
+from .models import (
+    CallContext,
+    Estimate,
+    FakeModelClient,
+    FakeReply,
+    ModelClient,
+    ModelRequest,
+    ToolCallDelta,
+    ToolSpec,
+)
 from .refs import Data, PublishedRef, Ref
 from .runner import InProcessRunner, TurnRunner
 from .storage import MemoryStorage, Storage
 from .views import (
     EntryView,
     Event,
+    InputView,
     Page,
     PendingQuestion,
     PublicationInfo,
+    RequestPreview,
     SessionInfo,
     Siblings,
     StateView,
@@ -60,14 +75,22 @@ __all__ = [
     "AssistantMessage",
     "BoutureError",
     "BuildContext",
+    "CallContext",
     "ChildResultContext",
     "Data",
+    "EntriesContext",
     "EntryView",
+    "Estimate",
     "Event",
     "FakeModelClient",
     "FakeReply",
     "ImageBlock",
+    "ImportedEntry",
+    "ImportedPublication",
     "InProcessRunner",
+    "InitContext",
+    "InputView",
+    "InvalidSettings",
     "InvalidTarget",
     "MemoryStorage",
     "ModelClient",
@@ -83,6 +106,7 @@ __all__ = [
     "PurgeContext",
     "ReasoningBlock",
     "Ref",
+    "RequestPreview",
     "ResolveContext",
     "ResolveError",
     "SchemaOutdated",
@@ -96,6 +120,7 @@ __all__ = [
     "TextBlock",
     "Tool",
     "ToolCallBlock",
+    "ToolCallDelta",
     "ToolContext",
     "ToolFatal",
     "ToolResultMessage",

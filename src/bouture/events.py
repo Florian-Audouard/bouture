@@ -11,7 +11,7 @@ from uuid import UUID
 from .storage.base import EventRecord, NewEvent, Storage
 from .views import Event
 
-DELTA_TYPES = ("text_delta", "reasoning_delta")
+DELTA_TYPES = ("text_delta", "reasoning_delta", "tool_call_delta")
 
 
 def now() -> datetime:
@@ -105,6 +105,37 @@ class EventSink:
         else:
             self._buf.append((type, {"entry_id": str(entry_id), "text": text}))
         self._buf_len += len(text)
+        if self._buf_len >= self._chars:
+            await self.flush()
+
+    async def tool_delta(
+        self, entry_id: UUID, index: int, tool_call_id: str | None, name: str | None, args: str
+    ) -> None:
+        """Fragment d'arguments d'outil (D105), fusionné avec le précédent du même appel."""
+        if not args:
+            return
+        last = self._buf[-1] if self._buf else None
+        if (
+            last is not None
+            and last[0] == "tool_call_delta"
+            and last[1]["entry_id"] == str(entry_id)
+            and last[1]["index"] == index
+        ):
+            last[1]["args_delta"] += args
+        else:
+            self._buf.append(
+                (
+                    "tool_call_delta",
+                    {
+                        "entry_id": str(entry_id),
+                        "index": index,
+                        "tool_call_id": tool_call_id,
+                        "name": name,
+                        "args_delta": args,
+                    },
+                )
+            )
+        self._buf_len += len(args)
         if self._buf_len >= self._chars:
             await self.flush()
 
