@@ -14,6 +14,7 @@ litellm = ["litellm>=1.60"]
 fastapi = ["fastapi>=0.110"]
 asyncpg = ["asyncpg>=0.29"]
 psycopg = ["psycopg[binary]>=3.1"]
+claude-code = ["claude-agent-sdk>=0.2.168"]
 
 [dependency-groups]
 dev = [
@@ -26,6 +27,7 @@ dev = [
     "asyncpg>=0.29",
     "uvicorn>=0.30",
     "litellm>=1.60",
+    "claude-agent-sdk>=0.2.168",
     "python-dotenv>=1.0",
 ]
 
