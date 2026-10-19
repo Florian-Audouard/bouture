@@ -24,8 +24,8 @@ Python ≥ 3.12.
 uv add "bouture[litellm,fastapi,asyncpg]"
 ```
 
-Extras : `litellm` (fournisseurs LLM), `fastapi` (routes), `asyncpg` ou `psycopg` (pilote
-Postgres ; LISTEN/NOTIFY requis).
+Extras : `litellm` (fournisseurs LLM), `claude-code` (abonnement Claude via Claude Code, voir
+plus bas), `fastapi` (routes), `asyncpg` ou `psycopg` (pilote Postgres ; LISTEN/NOTIFY requis).
 
 ## Démarrage rapide
 
@@ -276,6 +276,22 @@ LLM_MODEL=anthropic/claude-sonnet-4.5       # un modèle qui gère les appels d'
 # LLM_BASE_URL=https://openrouter.ai/api/v1  # défaut ; tout autre endpoint compatible OpenAI
 # DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/db
 ```
+
+Pour utiliser un abonnement Claude (Pro / Max) au lieu d'une clé d'API, installez l'extra
+`claude-code`, connectez Claude Code une fois (`claude setup-token`, puis
+`CLAUDE_CODE_OAUTH_TOKEN=…` dans l'environnement, ou `claude login`), et mettez dans le `.env` :
+
+```dotenv
+LLM_PROVIDER=claude-code
+LLM_MODEL=sonnet                            # alias ou identifiant Claude Code ; défaut sonnet
+```
+
+`ClaudeCodeClient` ([src/bouture/models/claude_code.py](src/bouture/models/claude_code.py)) lance
+Claude Code à chaque appel : l'historique lui est passé en transcript, les outils en MCP, et
+l'exécution s'arrête au premier appel d'outil pour que bouture l'exécute. Comptez une à deux
+secondes de latence par appel. Réservé au développement et à l'usage personnel : les conditions
+d'Anthropic interdisent d'offrir un abonnement claude.ai aux utilisateurs d'un produit ; en
+production, utilisez une clé d'API avec `LiteLLMClient`.
 
 Les variables déjà présentes dans l'environnement priment sur le `.env` (voir
 [examples/llm.py](examples/llm.py)). `DATABASE_URL` active Postgres, sinon le stockage est en mémoire.
