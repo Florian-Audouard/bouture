@@ -28,6 +28,7 @@ from .base import (
     SessionRecord,
     StateRecord,
     TurnRecord,
+    json_contains,
 )
 
 _TABLES = (
@@ -40,23 +41,6 @@ _TABLES = (
     "child_results",
     "events",
 )
-
-
-def _contains(doc: Any, sub: Any) -> bool:
-    """Équivalent mémoire de l'opérateur JSONB ``@>``."""
-    if isinstance(sub, dict):
-        if not isinstance(doc, dict):
-            return False
-        d: dict[str, Any] = doc  # pyright: ignore[reportUnknownVariableType]
-        s: dict[str, Any] = sub  # pyright: ignore[reportUnknownVariableType]
-        return all(k in d and _contains(d[k], v) for k, v in s.items())
-    if isinstance(sub, list):
-        if not isinstance(doc, list):
-            return False
-        dl: list[Any] = doc  # pyright: ignore[reportUnknownVariableType]
-        sl: list[Any] = sub  # pyright: ignore[reportUnknownVariableType]
-        return all(any(_contains(x, v) for x in dl) for v in sl)
-    return doc == sub
 
 
 class MemoryStorage:
@@ -158,7 +142,7 @@ class _MemoryTx:
             and ((s.archived_at is not None) == archived)
             and (before is None or (s.updated_at, s.id) < before)
             and (object_id is None or s.object_id == object_id)
-            and (metadata is None or _contains(s.metadata, metadata))
+            and (metadata is None or json_contains(s.metadata, metadata))
         ]
         rows.sort(key=lambda s: (s.updated_at, s.id), reverse=True)
         return [copy.deepcopy(s) for s in rows[:limit]]

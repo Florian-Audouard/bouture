@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -116,11 +117,20 @@ if sys.platform == "win32" and PG_URL and "psycopg" in PG_URL:
         return asyncio.WindowsSelectorEventLoopPolicy()  # type: ignore[attr-defined]
 
 
-@pytest.fixture(params=["memory", "postgres"])
-async def storage(request: pytest.FixtureRequest) -> AsyncIterator[Storage]:
-    """Chaque test tourne sur la mémoire et, si ``BOUTURE_TEST_PG_URL`` est défini, sur Postgres."""
+@pytest.fixture(params=["memory", "postgres", "sqlite"])
+async def storage(request: pytest.FixtureRequest, tmp_path: Path) -> AsyncIterator[Storage]:
+    """Chaque test tourne sur la mémoire, sur SQLite (fichier temporaire, chemin avec espaces)
+    et, si ``BOUTURE_TEST_PG_URL`` est défini, sur Postgres."""
     if request.param == "memory":
         yield MemoryStorage()
+        return
+    if request.param == "sqlite":
+        from bouture.storage.sqlite import SQLiteStorage
+
+        lite = SQLiteStorage(tmp_path / "dossier avec espaces" / "bouture.db")
+        await lite.setup()
+        yield lite
+        await lite.close()
         return
     if not PG_URL:
         pytest.skip("BOUTURE_TEST_PG_URL non défini")
