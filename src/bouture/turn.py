@@ -14,7 +14,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import jsonpatch
 from .context import BuildContext, ChildResultContext, EntriesContext, ImageContext, ToolContext
-from .definition import AgentDefinition, AskUser
+from .definition import INHERIT, AgentDefinition, AskUser
 from .errors import BoutureError, ModelError, StateValidationError, ToolFatal
 from .events import EventSink, now
 from .ids import uuid7
@@ -57,6 +57,9 @@ if TYPE_CHECKING:
     from .agents import Agents
 
 log = logging.getLogger("bouture")
+
+# Attente du battement du bail ; remplacée par une horloge simulée dans les tests (D122).
+_sleep = asyncio.sleep
 
 _IMAGE_ERROR = "Erreur : image(s) renvoyée(s) par l'outil impossible(s) à charger."
 CANCELLED_QUESTION = "Question annulée : l'utilisateur a poursuivi sans y répondre."
@@ -731,7 +734,7 @@ class TurnExecutor:
         before = StateCodec.dump(self.state)
         self._tool_before = before
         ctx = self._tool_ctx(entry_id)
-        timeout = tool.timeout or d.tool_timeout
+        timeout = d.tool_timeout if tool.timeout is INHERIT else tool.timeout
         try:
             result = await asyncio.wait_for(tool.fn(ctx, **kwargs), timeout)
         except (asyncio.CancelledError, ToolFatal):
@@ -837,9 +840,14 @@ class TurnExecutor:
             await self._record_result(q["tool_call_id"], q["tool_name"], INTERRUPTED_CALL, True)
 
     async def _heartbeat(self) -> None:
+        """Renouvelle le bail tous les ``lock_ttl / 3``, indépendamment des étapes (D122).
+
+        Tâche à part : un outil qui attend (I/O, ``asyncio.to_thread``, sous-processus) n'empêche
+        pas le renouvellement, quelle que soit sa durée. Un outil qui bloque la boucle, si.
+        """
         a = self.agents
         while True:
-            await asyncio.sleep(a.lock_ttl / 3)
+            await _sleep(a.lock_ttl / 3)
             action = None
             try:
                 async with a.storage.transaction() as tx:

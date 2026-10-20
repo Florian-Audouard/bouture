@@ -6,7 +6,8 @@ import inspect
 import typing
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, overload
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Final, overload
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, create_model
@@ -55,15 +56,34 @@ DEFAULT_OVERRIDABLE_SETTINGS = frozenset(
 """Réglages qu'une session peut surcharger par défaut (D92) : échantillonnage uniquement."""
 
 
+class _Inherit(Enum):
+    INHERIT = "inherit"
+
+
+INHERIT: Final = _Inherit.INHERIT
+"""Délai d'un outil non précisé : celui de la définition (``tool_timeout``) s'applique (D121)."""
+
+
+def _check_timeout(timeout: float | None, what: str) -> None:
+    if timeout is not None and timeout <= 0:
+        raise ValueError(f"{what} doit être positif ou None (sans limite), reçu {timeout}")
+
+
 class Tool:
     def __init__(
-        self, fn: ToolFn, *, name: str | None = None, timeout: float | None = None
+        self,
+        fn: ToolFn,
+        *,
+        name: str | None = None,
+        timeout: float | None | _Inherit = INHERIT,
     ) -> None:
         if not inspect.iscoroutinefunction(fn):
             raise TypeError(f"l'outil {fn.__name__} doit être une fonction async")
         self.fn = fn
         self.name = name or fn.__name__
         self.description = inspect.getdoc(fn) or ""
+        if timeout is not INHERIT:
+            _check_timeout(timeout, f"timeout de l'outil {self.name}")
         self.timeout = timeout
         self.answer_fn: AnswerFn | None = None
         self.params_model = _params_model(fn, self.name)
@@ -114,7 +134,7 @@ class AgentDefinition[S, D]:
         model_settings: Mapping[str, Any] | None = None,
         inputs: Mapping[str, str] | None = None,
         max_steps: int = 25,
-        tool_timeout: float = 120.0,
+        tool_timeout: float | None = 120.0,
         overridable_settings: Collection[str] | None = None,
         stream_tool_args: bool = False,
         provider_tools: Collection[str] | None = None,
@@ -141,6 +161,7 @@ class AgentDefinition[S, D]:
         self.model_settings = dict(model_settings or {})
         self.inputs = dict(inputs or {})
         self.max_steps = max_steps
+        _check_timeout(tool_timeout, "tool_timeout")
         self.tool_timeout = tool_timeout
         self.overridable_settings = frozenset(
             DEFAULT_OVERRIDABLE_SETTINGS if overridable_settings is None else overridable_settings
@@ -178,7 +199,7 @@ class AgentDefinition[S, D]:
     def tool(self, fn: Callable[..., Awaitable[Any]], /) -> Tool: ...
     @overload
     def tool(
-        self, /, *, name: str | None = None, timeout: float | None = None
+        self, /, *, name: str | None = None, timeout: float | None | _Inherit = INHERIT
     ) -> Callable[[Callable[..., Awaitable[Any]]], Tool]: ...
     def tool(
         self,
@@ -186,9 +207,13 @@ class AgentDefinition[S, D]:
         /,
         *,
         name: str | None = None,
-        timeout: float | None = None,
+        timeout: float | None | _Inherit = INHERIT,
     ) -> Tool | Callable[[Callable[..., Awaitable[Any]]], Tool]:
-        """Enregistre un outil. Le premier paramètre reçoit un ``ToolContext[S, D]``."""
+        """Enregistre un outil. Le premier paramètre reçoit un ``ToolContext[S, D]``.
+
+        ``timeout`` : secondes, ``None`` = sans limite ; omis = ``tool_timeout`` de la
+        définition (D121).
+        """
 
         def register(f: Callable[..., Awaitable[Any]]) -> Tool:
             t = Tool(f, name=name, timeout=timeout)
