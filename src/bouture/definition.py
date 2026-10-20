@@ -11,7 +11,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, create_model
 
-from .models.base import ToolSpec
+from .models.base import PROVIDER_TOOLS, ToolSpec
 
 if TYPE_CHECKING:
     from .context import (
@@ -117,14 +117,22 @@ class AgentDefinition[S, D]:
         tool_timeout: float = 120.0,
         overridable_settings: Collection[str] | None = None,
         stream_tool_args: bool = False,
+        provider_tools: Collection[str] | None = None,
     ) -> None:
         if state_type is not None and not (
             isinstance(state_type, type)  # pyright: ignore[reportUnnecessaryIsInstance]
             and issubclass(state_type, BaseModel)
         ):
             raise TypeError("state_type doit être un modèle Pydantic")
+        unknown = sorted(set(provider_tools or ()) - PROVIDER_TOOLS)
+        if unknown:
+            raise ValueError(
+                f"outils fournisseur inconnus : {unknown} (connus : {sorted(PROVIDER_TOOLS)})"
+            )
         self.kind = kind
         self.model = model
+        # Exécutés par le fournisseur, jamais par bouture (D116).
+        self.provider_tools: tuple[str, ...] = tuple(dict.fromkeys(provider_tools or ()))
         self.state_type = state_type
         self._initial_state = initial_state
         self.state_version = state_version

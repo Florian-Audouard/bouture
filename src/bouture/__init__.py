@@ -29,11 +29,13 @@ from .errors import (
     StateVersionError,
     ToolFatal,
     UnknownKind,
+    UnsupportedProviderTool,
 )
 from .importing import ImportedEntry, ImportedPublication
 from .messages import (
     AssistantMessage,
     ImageBlock,
+    ProviderToolBlock,
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
@@ -108,6 +110,7 @@ __all__ = [
     "PublishContext",
     "PublishedRef",
     "PurgeContext",
+    "ProviderToolBlock",
     "ReasoningBlock",
     "Ref",
     "RequestPreview",
@@ -127,6 +130,7 @@ __all__ = [
     "ToolCallDelta",
     "ToolContext",
     "ToolFatal",
+    "UnsupportedProviderTool",
     "ToolResultMessage",
     "ToolSpec",
     "TurnEndContext",

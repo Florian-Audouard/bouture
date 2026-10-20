@@ -35,6 +35,10 @@ class InvalidSettings(BoutureError):
     """Réglage de modèle non surchargeable pour ce kind (D92)."""
 
 
+class UnsupportedProviderTool(BoutureError):
+    """Outil fournisseur demandé par un kind mais non supporté par le client et le modèle (D117)."""
+
+
 class ResolveError(BoutureError):
     """Un input ne peut pas être résolu (référence morte, kind inattendu…)."""
 

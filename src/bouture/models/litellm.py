@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import aclosing
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from ..errors import ModelError
 from ..messages import (
+    AssistantMessage,
     ImageBlock,
     Message,
+    ProviderToolBlock,
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
@@ -24,15 +26,23 @@ from .base import (
     LoadedImage,
     ModelEvent,
     ModelRequest,
+    ProviderToolCall,
+    ProviderToolResult,
     ReasoningDelta,
     TextDelta,
     ToolCallComplete,
     ToolCallDelta,
     UsageReport,
+    clip_result,
     image_url,
+    provider_tool_text,
 )
 
 ToolImages = Literal["auto", "inline", "user"]
+
+# Outils fournisseur (D116) → outils hébergés d'Anthropic, transmis tels quels par LiteLLM (D120).
+HOSTED_TOOLS = {"web_search": "web_search_20250305", "web_fetch": "web_fetch_20250910"}
+_SERVER_ID = "srvtoolu_"
 
 Credentials = Callable[[ModelRequest], Awaitable[Mapping[str, Any]]]
 
@@ -70,6 +80,10 @@ class LiteLLMClient:
     les résultats d'outils (OpenAI n'accepte que du texte dans un message ``tool``) ;
     ``"auto"`` (défaut) choisit ``"inline"`` pour le fournisseur ``anthropic``, ``"user"``
     sinon.
+
+    Outils fournisseur (D120) : ``web_search`` / ``web_fetch`` pour le fournisseur
+    ``anthropic`` seulement (outils hébergés, exécutés par l'API dans le même appel).
+    ``provider_tool_options`` complète leur déclaration (``{"web_search": {"max_uses": 3}}``).
     """
 
     def __init__(
@@ -78,11 +92,13 @@ class LiteLLMClient:
         *,
         credentials: Credentials | None = None,
         tool_images: ToolImages = "auto",
+        provider_tool_options: Mapping[str, Mapping[str, Any]] | None = None,
         **extra: Any,
     ) -> None:
         self.api_keys = api_keys or {}
         self.credentials = credentials
         self.tool_images: ToolImages = tool_images
+        self.provider_tool_options = {k: dict(v) for k, v in (provider_tool_options or {}).items()}
         self.extra = extra
 
     def _messages(self, request: ModelRequest) -> list[dict[str, Any]]:
@@ -92,6 +108,20 @@ class LiteLLMClient:
         return to_openai_messages(
             request.system, request.messages, images=request.images, tool_images=mode
         )
+
+    def provider_tools(self, model: str) -> frozenset[str]:
+        return frozenset(HOSTED_TOOLS) if _provider(model) == "anthropic" else frozenset()
+
+    def _hosted(self, request: ModelRequest) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": HOSTED_TOOLS[n],
+                "name": n,
+                **self.provider_tool_options.get(n, {}),
+            }
+            for n in request.provider_tools
+            if n in HOSTED_TOOLS
+        ]
 
     def _key(self, model: str) -> str | None:
         return self.api_keys.get(model.split("/", 1)[0])
@@ -125,7 +155,7 @@ class LiteLLMClient:
             **self.extra,
             **request.settings,
         }
-        if tools := _tools(request):
+        if tools := [*(_tools(request) or []), *self._hosted(request)]:
             kwargs["tools"] = tools
         if key := self._key(request.model):
             kwargs["api_key"] = key
@@ -144,6 +174,8 @@ class LiteLLMClient:
             raise ModelError(_safe(exc), code=type(exc).__name__) from exc
 
         calls: dict[int, dict[str, Any]] = {}
+        provided: set[str] = set()  # outils fournisseur déjà émis
+        answered: set[str] = set()
         finish: str | None = None
         try:
             async with aclosing(response) as chunks:  # type: ignore[arg-type]
@@ -163,19 +195,35 @@ class LiteLLMClient:
                     if delta.content:
                         yield TextDelta(delta.content)
                     for tc in getattr(delta, "tool_calls", None) or []:
-                        slot = calls.setdefault(tc.index, {"id": None, "name": "", "args": ""})
+                        slot = calls.setdefault(
+                            tc.index, {"id": None, "name": "", "args": "", "server": False}
+                        )
                         if tc.id:
                             slot["id"] = tc.id
+                            slot["server"] = str(tc.id).startswith(_SERVER_ID)
                         if tc.function and tc.function.name:
                             slot["name"] = tc.function.name
                         if tc.function and tc.function.arguments:
                             slot["args"] += tc.function.arguments
+                            if slot["server"]:
+                                continue  # exécuté par le fournisseur (D120)
                             yield ToolCallDelta(
                                 tc.index,
                                 tc.id or None,
                                 tc.function.name or None,
                                 tc.function.arguments,
                             )
+                    for block in _server_results(chunk, delta):
+                        call_id = str(block.get("tool_use_id", ""))
+                        if not call_id or call_id in answered:
+                            continue
+                        answered.add(call_id)
+                        slot = next((c for c in calls.values() if c["id"] == call_id), None)
+                        if slot is not None and call_id not in provided:
+                            provided.add(call_id)
+                            yield ProviderToolCall(call_id, slot["name"], _args(slot["args"]))
+                        text, is_error = summarize_server_result(block)
+                        yield ProviderToolResult(call_id, text, is_error)
                     if choice.finish_reason:
                         finish = choice.finish_reason
         except _TRANSIENT as exc:
@@ -188,12 +236,78 @@ class LiteLLMClient:
             raise
         for index in sorted(calls):
             slot = calls[index]
-            try:
-                args = json.loads(slot["args"] or "{}")
-            except json.JSONDecodeError:
-                args = {"_raw": slot["args"]}
+            if slot["server"]:
+                if slot["id"] not in provided:  # appel sans résultat (interrompu, pause_turn)
+                    yield ProviderToolCall(slot["id"], slot["name"], _args(slot["args"]))
+                continue
+            args = _args(slot["args"])
             yield ToolCallComplete(id=slot["id"] or f"call_{index}", name=slot["name"], args=args)
         yield Done(finish)
+
+
+def _args(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {"_raw": raw}
+    return cast("dict[str, Any]", value) if isinstance(value, dict) else {"_raw": raw}
+
+
+def _server_results(chunk: Any, delta: Any) -> list[dict[str, Any]]:
+    """Blocs ``*_tool_result`` des outils hébergés, cumulés par LiteLLM au fil du flux."""
+    for holder in (delta, chunk):
+        fields = getattr(holder, "provider_specific_fields", None)
+        if isinstance(fields, dict):
+            results = cast("dict[str, Any]", fields).get("web_search_results")
+            if isinstance(results, list):
+                return [b for b in cast("list[Any]", results) if isinstance(b, dict)]
+    return []
+
+
+def summarize_server_result(block: Mapping[str, Any]) -> tuple[str, bool]:
+    """Résultat d'un outil hébergé Anthropic → (texte, erreur ?) (D120).
+
+    Recherche : titres et URL ; lecture : URL, titre et texte borné. Le contenu chiffré de
+    l'API n'est pas conservé (le rejeu est en texte, D118).
+    """
+    content: Any = block.get("content")
+    if isinstance(content, dict):
+        c = cast("dict[str, Any]", content)
+        ctype = str(c.get("type", ""))
+        if ctype.endswith("_error"):
+            return f"erreur : {c.get('error_code', 'inconnue')}", True
+        if ctype == "web_fetch_result":
+            doc = cast("dict[str, Any]", c.get("content") or {})
+            source = cast("dict[str, Any]", doc.get("source") or {})
+            lines = [str(c.get("url", ""))]
+            if doc.get("title"):
+                lines.append(str(doc["title"]))
+            if source.get("type") == "text":
+                lines += ["", str(source.get("data", ""))]
+            elif source:
+                lines.append(f"[document {source.get('media_type', source.get('type'))}]")
+            return clip_result("\n".join(lines)), False
+        return clip_result(json.dumps(c, ensure_ascii=False)), False
+    if isinstance(content, list):
+        lines = [
+            f"- {r.get('title', '')} — {r.get('url', '')}"
+            for r in cast("list[dict[str, Any]]", content)
+            if isinstance(r, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
+        ]
+        return clip_result("\n".join(lines) or "aucun résultat"), False
+    return "", False
+
+
+def _assistant_text(m: AssistantMessage) -> str:
+    """Texte d'un message assistant ; les outils fournisseur passés y sont rejoués (D118)."""
+    if not m.provider_tools:
+        return m.text
+    parts = [
+        provider_tool_text(b) if isinstance(b, ProviderToolBlock) else b.text
+        for b in m.content
+        if isinstance(b, TextBlock | ProviderToolBlock)
+    ]
+    return "\n".join(p for p in parts if p)
 
 
 def _tools(request: ModelRequest) -> list[dict[str, Any]] | None:
@@ -294,7 +408,8 @@ def to_openai_messages(
                 content = "\n".join(t for t in texts if t)
                 out.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": content})
         else:
-            msg: dict[str, Any] = {"role": "assistant", "content": m.text or None}
+            text = _assistant_text(m)
+            msg: dict[str, Any] = {"role": "assistant", "content": text or None}
             thinking = [
                 {"type": "thinking", "thinking": b.text, "signature": b.signature}
                 for b in m.content

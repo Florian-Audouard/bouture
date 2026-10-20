@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import AsyncIterator, Mapping
+import json
+from collections.abc import AsyncIterator, Collection, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
-from ..messages import ImageBlock, Message, Usage
+from ..messages import ImageBlock, Message, ProviderToolBlock, Usage
 
 
 @dataclass(slots=True)
@@ -19,6 +20,10 @@ class CallContext:
     session_id: UUID | None
     kind: str
     turn_id: UUID | None = None
+
+
+PROVIDER_TOOLS = frozenset({"web_search", "web_fetch"})
+"""Outils exécutés côté fournisseur que bouture sait demander (D116)."""
 
 
 @dataclass(slots=True)
@@ -47,6 +52,7 @@ class ModelRequest:
     """``images`` : octets des ``ImageBlock`` de ``messages``, par ``ref`` (vide sans loader).
 
     Une image absente de ``images`` est passée au fournisseur par sa référence (URL).
+    ``provider_tools`` : outils exécutés par le fournisseur (D116), noms de ``PROVIDER_TOOLS``.
     """
 
     model: str
@@ -56,12 +62,33 @@ class ModelRequest:
     settings: dict[str, Any] = field(default_factory=dict)
     context: CallContext | None = None
     images: dict[str, LoadedImage] = field(default_factory=dict[str, LoadedImage])
+    provider_tools: list[str] = field(default_factory=list[str])
 
 
 def image_url(block: ImageBlock, images: Mapping[str, LoadedImage]) -> str:
     """URL à transmettre : ``data:`` si l'image a été chargée, sinon la référence telle quelle."""
     loaded = images.get(block.ref)
     return loaded.data_url() if loaded is not None else block.ref
+
+
+PROVIDER_RESULT_MAX = 20_000
+"""Taille maximale (caractères) du résumé conservé d'un résultat d'outil fournisseur."""
+
+
+def clip_result(text: str) -> str:
+    if len(text) <= PROVIDER_RESULT_MAX:
+        return text
+    return text[:PROVIDER_RESULT_MAX] + f"\n[… tronqué, {len(text)} caractères]"
+
+
+def provider_tool_text(block: ProviderToolBlock) -> str:
+    """Rejeu d'un outil fournisseur passé : en texte, le fournisseur n'en garde pas trace (D118)."""
+    args = json.dumps(block.args, ensure_ascii=False)
+    head = f'<provider_tool id="{block.id}" name="{block.name}">{args}</provider_tool>'
+    if block.result is None:
+        return head
+    error = ' error="true"' if block.is_error else ""
+    return f"{head}\n<provider_tool_result{error}>\n{block.result}\n</provider_tool_result>"
 
 
 @dataclass(slots=True)
@@ -93,6 +120,24 @@ class ToolCallDelta:
 
 
 @dataclass(slots=True)
+class ProviderToolCall:
+    """Le fournisseur a appelé un de ses outils (D116) ; bouture ne l'exécute pas."""
+
+    id: str
+    name: str
+    args: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ProviderToolResult:
+    """Résultat (résumé en texte) d'un ``ProviderToolCall`` du même appel."""
+
+    id: str
+    content: str
+    is_error: bool = False
+
+
+@dataclass(slots=True)
 class UsageReport:
     usage: Usage
 
@@ -110,7 +155,16 @@ class Estimate:
     cost: float | None = None
 
 
-ModelEvent = TextDelta | ReasoningDelta | ToolCallDelta | ToolCallComplete | UsageReport | Done
+ModelEvent = (
+    TextDelta
+    | ReasoningDelta
+    | ToolCallDelta
+    | ToolCallComplete
+    | ProviderToolCall
+    | ProviderToolResult
+    | UsageReport
+    | Done
+)
 
 
 class ModelClient(Protocol):
@@ -123,5 +177,15 @@ class ModelClient(Protocol):
         ...
 
 
-# Méthode facultative d'un ``ModelClient`` (D93), détectée par ``getattr`` :
-#     async def estimate(self, request: ModelRequest) -> Estimate
+# Méthodes facultatives d'un ``ModelClient``, détectées par ``getattr`` :
+#     async def estimate(self, request: ModelRequest) -> Estimate                  (D93)
+#     def provider_tools(self, model: str) -> Collection[str]                      (D117)
+# Sans ``provider_tools``, le client n'en supporte aucun.
+
+
+def supported_provider_tools(client: object, model: str) -> frozenset[str]:
+    """Outils fournisseur que ``client`` sait exécuter pour ``model`` (D117)."""
+    fn = getattr(client, "provider_tools", None)
+    if not callable(fn):
+        return frozenset()
+    return frozenset(cast("Collection[str]", fn(model)))

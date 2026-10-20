@@ -1,4 +1,5 @@
 from .base import (
+    PROVIDER_TOOLS,
     CallContext,
     Done,
     Estimate,
@@ -6,6 +7,8 @@ from .base import (
     ModelClient,
     ModelEvent,
     ModelRequest,
+    ProviderToolCall,
+    ProviderToolResult,
     ReasoningDelta,
     TextDelta,
     ToolCallComplete,
@@ -13,6 +16,7 @@ from .base import (
     ToolSpec,
     UsageReport,
     image_url,
+    supported_provider_tools,
 )
 from .fake import FakeModelClient, FakeReply
 
@@ -23,9 +27,12 @@ __all__ = [
     "FakeModelClient",
     "FakeReply",
     "LoadedImage",
+    "PROVIDER_TOOLS",
     "ModelClient",
     "ModelEvent",
     "ModelRequest",
+    "ProviderToolCall",
+    "ProviderToolResult",
     "ReasoningDelta",
     "TextDelta",
     "ToolCallComplete",
@@ -33,4 +40,5 @@ __all__ = [
     "ToolSpec",
     "UsageReport",
     "image_url",
+    "supported_provider_tools",
 ]

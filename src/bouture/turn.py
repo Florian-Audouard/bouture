@@ -22,6 +22,7 @@ from .messages import (
     AssistantMessage,
     ImageBlock,
     Message,
+    ProviderToolBlock,
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
@@ -38,6 +39,8 @@ from .models.base import (
     LoadedImage,
     ModelEvent,
     ModelRequest,
+    ProviderToolCall,
+    ProviderToolResult,
     ReasoningDelta,
     TextDelta,
     ToolCallComplete,
@@ -244,7 +247,17 @@ async def build_request(
         request = bctx.default_request()
     if request.context is None:
         request.context = CallContext(owner, session_id, definition.kind, turn_id)
+    if not request.provider_tools:
+        request.provider_tools = list(definition.provider_tools)
     return request
+
+
+def _set_provider_result(blocks: list[Any], call_id: str, content: str, is_error: bool) -> None:
+    """Range le résultat d'un outil fournisseur dans son bloc (le plus récent de même id)."""
+    for b in reversed(blocks):
+        if isinstance(b, ProviderToolBlock) and b.id == call_id:
+            b.result, b.is_error = content, is_error
+            return
 
 
 async def _aclose(it: AsyncIterator[ModelEvent]) -> None:
@@ -564,7 +577,7 @@ class TurnExecutor:
     # -- appel au modèle -------------------------------------------------------------
     def _append(self, kind: str, text: str, signature: str | None = None) -> None:
         assert self._open_msg is not None
-        blocks: list[TextBlock | ReasoningBlock] = self._open_msg["blocks"]
+        blocks: list[TextBlock | ReasoningBlock | ProviderToolBlock] = self._open_msg["blocks"]
         last = blocks[-1] if blocks else None
         if kind == "text":
             if isinstance(last, TextBlock):
@@ -620,6 +633,33 @@ class TurnExecutor:
                                 "tool_call_id": ev.id,
                                 "name": ev.name,
                                 "args": ev.args,
+                            },
+                        )
+                    elif isinstance(ev, ProviderToolCall):
+                        got_token = True
+                        block = ProviderToolBlock(id=ev.id, name=ev.name, args=ev.args)
+                        self._open_msg["blocks"].append(block)
+                        await self.sink.emit(
+                            "provider_tool_call",
+                            {
+                                "entry_id": str(entry_id),
+                                "id": ev.id,
+                                "name": ev.name,
+                                "args": ev.args,
+                            },
+                        )
+                    elif isinstance(ev, ProviderToolResult):
+                        got_token = True
+                        _set_provider_result(
+                            self._open_msg["blocks"], ev.id, ev.content, ev.is_error
+                        )
+                        await self.sink.emit(
+                            "provider_tool_result",
+                            {
+                                "entry_id": str(entry_id),
+                                "id": ev.id,
+                                "content": ev.content,
+                                "is_error": ev.is_error,
                             },
                         )
                     elif isinstance(ev, UsageReport):
@@ -1031,6 +1071,12 @@ async def recover_crashed(agents: Agents[Any], tx: StorageTx, s: SessionRecord) 
                     blocks[-1].text += d["text"]
                 else:
                     blocks.append(cls(text=d["text"]))
+            elif ev.type == "provider_tool_call" and open_msg is not None:
+                open_msg["blocks"].append(
+                    ProviderToolBlock(id=d["id"], name=d["name"], args=d["args"])
+                )
+            elif ev.type == "provider_tool_result" and open_msg is not None:
+                _set_provider_result(open_msg["blocks"], d["id"], d["content"], d["is_error"])
             elif ev.type == "tool_call" and open_msg is not None:
                 open_msg["calls"].append(
                     ToolCallBlock(id=d["tool_call_id"], name=d["name"], args=d["args"])

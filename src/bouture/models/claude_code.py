@@ -13,6 +13,9 @@ Limites par rapport à ``LiteLLMClient`` :
   référence ;
 - les outils sont exposés en MCP ; un hook ``PreToolUse`` les « diffère » pour que Claude Code
   s'arrête au premier appel sans l'exécuter : c'est bouture qui exécute les outils ;
+- outils fournisseur (D119) : ``WebSearch`` / ``WebFetch`` du CLI, autorisés par le hook et
+  exécutés par Claude Code ; chacun consomme un tour, d'où ``max_turns = 1 +
+  provider_tool_turns`` ; ils sont rendus comme ``ProviderToolCall`` / ``ProviderToolResult`` ;
 - signatures de raisonnement non conservées, pas d'``estimate`` ; chaque appel démarre un
   processus (une à deux secondes de latence).
 """
@@ -30,6 +33,7 @@ from ..messages import (
     AssistantMessage,
     ImageBlock,
     Message,
+    ProviderToolBlock,
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
@@ -42,12 +46,16 @@ from .base import (
     LoadedImage,
     ModelEvent,
     ModelRequest,
+    ProviderToolCall,
+    ProviderToolResult,
     ReasoningDelta,
     TextDelta,
     ToolCallComplete,
     ToolCallDelta,
     ToolSpec,
     UsageReport,
+    clip_result,
+    provider_tool_text,
 )
 
 try:
@@ -59,14 +67,19 @@ SERVER = "bouture"
 PREFIX = f"mcp__{SERVER}__"
 MODEL_PREFIX = "claude-code/"
 
+# Outils fournisseur (D116) → outils du CLI qui les exécutent (D119).
+CLI_TOOLS = {"web_search": "WebSearch", "web_fetch": "WebFetch"}
+_NEUTRAL = {v: k for k, v in CLI_TOOLS.items()}
+
 # Erreurs d'``AssistantMessage.error`` qu'un nouvel essai peut résoudre.
 _TRANSIENT = {"rate_limit", "server_error"}
 
 PROTOCOL = """\
 La conversation jusqu'ici est donnée dans le message de l'utilisateur, sous forme de transcript \
 entre balises <transcript>. Les appels d'outils passés et leurs résultats y figurent pour \
-mémoire. Réponds en tant qu'assistant au dernier tour uniquement, sans reprendre ces balises. \
-Pour appeler un outil, utilise le mécanisme d'appel d'outils, jamais du texte."""
+mémoire, de même que les recherches déjà faites (<provider_tool>). Réponds en tant \
+qu'assistant au dernier tour uniquement, sans reprendre ces balises. Pour appeler un outil, \
+utilise le mécanisme d'appel d'outils, jamais du texte."""
 
 Query = Callable[..., AsyncIterator[Any]]
 
@@ -78,6 +91,10 @@ class ClaudeCodeClient:
     ``use_subscription`` (défaut) masque ``ANTHROPIC_API_KEY`` au CLI pour qu'il utilise
     l'abonnement même si une clé traîne dans l'environnement. ``options`` est passé tel quel à
     ``ClaudeAgentOptions`` (``cli_path``, ``effort``, ``thinking``, ``env``…).
+
+    ``provider_tool_turns`` (D119) : nombre d'appels ``WebSearch`` / ``WebFetch`` permis dans un
+    même appel au modèle quand le kind en demande ; au-delà, Claude Code s'arrête
+    (``Done("max_turns")``) avec le texte déjà produit.
     """
 
     def __init__(
@@ -85,13 +102,18 @@ class ClaudeCodeClient:
         *,
         use_subscription: bool = True,
         query: Query | None = None,
+        provider_tool_turns: int = 8,
         **options: Any,
     ) -> None:
         self.use_subscription = use_subscription
+        self.provider_tool_turns = provider_tool_turns
         self.options = options
         self._query: Query = query or sdk.query
         # Répertoire vide : Claude Code n'y trouve ni CLAUDE.md ni fichiers du projet.
         self._cwd = tempfile.mkdtemp(prefix="bouture-claude-code-")
+
+    def provider_tools(self, model: str) -> frozenset[str]:
+        return frozenset(CLI_TOOLS)
 
     def _options(self, request: ModelRequest) -> Any:
         env: dict[str, str] = dict(self.options.get("env", {}))
@@ -109,14 +131,14 @@ class ClaudeCodeClient:
         fields: dict[str, Any] = {
             "model": _model(request.model),
             "system_prompt": system,
-            "tools": [],
+            "tools": [CLI_TOOLS[n] for n in request.provider_tools if n in CLI_TOOLS],
             "mcp_servers": servers,
             "strict_mcp_config": True,
             "setting_sources": [],
             "hooks": {"PreToolUse": [sdk.HookMatcher(hooks=[_defer])]},
             "include_partial_messages": True,
             "verbatim_prompts": True,
-            "max_turns": 1,
+            "max_turns": 1 + (self.provider_tool_turns if request.provider_tools else 0),
             "cwd": self._cwd,
             "env": env,
             **settings,
@@ -131,6 +153,8 @@ class ClaudeCodeClient:
         usage = Usage(model=request.model)
         blocks: dict[int, dict[str, Any]] = {}
         calls: dict[str, ToolCallComplete] = {}
+        provided: set[str] = set()  # ids des outils fournisseur déjà émis
+        meter = {"base": 0}
         stop: str | None = None
         try:
             async with aclosing(
@@ -140,7 +164,7 @@ class ClaudeCodeClient:
                     if getattr(msg, "parent_tool_use_id", None):
                         continue
                     if isinstance(msg, sdk.StreamEvent):
-                        for ev in _stream_event(msg.event, blocks, usage):
+                        for ev in _stream_event(msg.event, blocks, usage, meter):
                             yield ev
                     elif isinstance(msg, sdk.AssistantMessage):
                         if msg.error:
@@ -150,13 +174,33 @@ class ClaudeCodeClient:
                                 code=str(msg.error),
                             )
                         for b in msg.content:
-                            if isinstance(b, sdk.ToolUseBlock):
+                            if isinstance(b, sdk.ToolUseBlock) and b.name in _NEUTRAL:
+                                if b.id not in provided:
+                                    provided.add(b.id)
+                                    yield ProviderToolCall(b.id, _NEUTRAL[b.name], b.input)
+                            elif isinstance(b, sdk.ServerToolUseBlock):
+                                if b.name in CLI_TOOLS and b.id not in provided:
+                                    provided.add(b.id)
+                                    yield ProviderToolCall(b.id, b.name, b.input)
+                            elif isinstance(b, sdk.ServerToolResultBlock):
+                                if b.tool_use_id in provided:
+                                    text = json.dumps(b.content, ensure_ascii=False)
+                                    yield ProviderToolResult(b.tool_use_id, clip_result(text))
+                            elif isinstance(b, sdk.ToolUseBlock):
                                 calls[b.id] = ToolCallComplete(b.id, _strip(b.name), b.input)
+                    elif isinstance(msg, sdk.UserMessage) and not isinstance(msg.content, str):
+                        for b in msg.content:
+                            if isinstance(b, sdk.ToolResultBlock) and b.tool_use_id in provided:
+                                yield ProviderToolResult(
+                                    b.tool_use_id, _result_text(b.content), bool(b.is_error)
+                                )
                     elif isinstance(msg, sdk.ResultMessage):
                         stop = msg.stop_reason
                         if msg.deferred_tool_use is not None:
                             d = msg.deferred_tool_use
                             calls.setdefault(d.id, ToolCallComplete(d.id, _strip(d.name), d.input))
+                        elif msg.subtype == "error_max_turns" and request.provider_tools:
+                            stop = "max_turns"  # budget d'outils fournisseur épuisé (D119)
                         elif msg.is_error and not calls:
                             raise ModelError(
                                 f"Claude Code : {msg.subtype}",
@@ -193,16 +237,42 @@ def _mcp_tool(spec: ToolSpec) -> Any:
 
 
 async def _defer(input: Any, tool_use_id: str | None, context: Any) -> Any:
-    """Arrête Claude Code avant l'exécution : l'appel revient à bouture."""
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "defer"}}
+    """Arrête Claude Code avant l'exécution : l'appel revient à bouture.
+
+    Seuls ``WebSearch`` / ``WebFetch`` (outils fournisseur, D119) sont exécutés par Claude Code.
+    """
+    name = cast("dict[str, Any]", input).get("tool_name") if isinstance(input, dict) else None
+    decision = "allow" if name in _NEUTRAL else "defer"
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision}}
+
+
+def _result_text(content: str | list[dict[str, Any]] | None) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return clip_result(content)
+    parts = [
+        c.get("text", "") if c.get("type") == "text" else f"[{c.get('type')}]" for c in content
+    ]
+    return clip_result("\n".join(p for p in parts if p))
 
 
 def _stream_event(
-    event: dict[str, Any], blocks: dict[int, dict[str, Any]], usage: Usage
+    event: dict[str, Any],
+    blocks: dict[int, dict[str, Any]],
+    usage: Usage,
+    meter: dict[str, int] | None = None,
 ) -> list[ModelEvent]:
-    """Événement brut de l'API Messages → événements bouture (et cumul de l'usage)."""
+    """Événement brut de l'API Messages → événements bouture (et cumul de l'usage).
+
+    Un appel peut contenir plusieurs messages de l'API (outils fournisseur, D119) : l'usage
+    s'additionne d'un message à l'autre, ``meter["base"]`` retient la sortie des précédents.
+    Les blocs ``tool_use`` d'un outil fournisseur ne produisent pas de ``ToolCallDelta``.
+    """
+    meter = meter if meter is not None else {"base": 0}
     kind = event.get("type")
     if kind == "message_start":
+        meter["base"] = usage.output_tokens
         u = event.get("message", {}).get("usage") or {}
         usage.input_tokens += u.get("input_tokens") or 0
         usage.cache_read += u.get("cache_read_input_tokens") or 0
@@ -210,11 +280,12 @@ def _stream_event(
         usage.output_tokens += u.get("output_tokens") or 0
     elif kind == "message_delta":
         u = event.get("usage") or {}
-        usage.output_tokens = max(usage.output_tokens, u.get("output_tokens") or 0)
+        out = meter["base"] + (u.get("output_tokens") or 0)
+        usage.output_tokens = max(usage.output_tokens, out)
     elif kind == "content_block_start":
         block = event.get("content_block") or {}
         blocks[event.get("index", 0)] = block
-        if block.get("type") == "tool_use":
+        if block.get("type") == "tool_use" and block.get("name") not in _NEUTRAL:
             return [
                 ToolCallDelta(event.get("index", 0), block.get("id"), _strip(block["name"]), "")
             ]
@@ -226,7 +297,8 @@ def _stream_event(
             return [TextDelta(delta["text"])]
         if dt == "thinking_delta" and delta.get("thinking"):
             return [ReasoningDelta(delta["thinking"])]
-        if dt == "input_json_delta" and delta.get("partial_json"):
+        provider = blocks.get(index, {}).get("name") in _NEUTRAL
+        if dt == "input_json_delta" and delta.get("partial_json") and not provider:
             return [ToolCallDelta(index, None, None, delta["partial_json"])]
     return []
 
@@ -268,6 +340,8 @@ def _segments(messages: list[Message]) -> list[Segment]:
                 elif isinstance(b, ToolCallBlock):
                     args = json.dumps(b.args, ensure_ascii=False)
                     lines.append(f'<tool_call id="{b.id}" name="{b.name}">{args}</tool_call>')
+                elif isinstance(b, ProviderToolBlock):
+                    lines.append(provider_tool_text(b))
                 elif isinstance(b, ReasoningBlock):
                     continue
             if lines:

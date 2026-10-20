@@ -150,6 +150,31 @@ async def load(ref: str, ctx: ImageContext[Deps]) -> tuple[bytes, str]:
 - `ClaudeCodeClient` : les images chargées partent en blocs base64 ; la CLI en écrit une copie
   temporaire sur le disque (D115).
 
+## Outils fournisseur
+
+Recherche et lecture web exécutées par le fournisseur du modèle ; bouture les trace dans l'arbre
+et les événements sans les exécuter (D116-D120).
+
+```python
+researcher = AgentDefinition[Notes, Deps]("researcher", model="claude-code/sonnet",
+                                          provider_tools=["web_search", "web_fetch"])
+```
+
+- Support par client, vérifié à `register` / `create_session` / `set_model` :
+  `UnsupportedProviderTool` sinon (D117).
+  - `ClaudeCodeClient(provider_tool_turns=8)` : `WebSearch` / `WebFetch` du CLI, au plus
+    `provider_tool_turns` appels par appel au modèle ; au-delà, le tour se termine avec le texte
+    produit (D119).
+  - `LiteLLMClient(provider_tool_options={"web_search": {"max_uses": 3}})` : outils hébergés
+    Anthropic, fournisseur `anthropic` seulement (D120).
+  - `FakeModelClient` : `FakeReply(..., provider_calls=[("web_search", {"query": "q"}, "résultat")],
+    after_text="…")`.
+- Arbre : `ProviderToolBlock(id, name, args, result, is_error)` dans le message assistant
+  (`AssistantMessage.provider_tools`) ; résultat résumé en texte, borné à 20 000 caractères.
+- Événements : `provider_tool_call` `{entry_id, id, name, args}`, puis `provider_tool_result`
+  `{entry_id, id, content, is_error}`. Pas de `tool_result`, pas de pas compté dans `max_steps`.
+- Les tours suivants revoient ces appels en texte (`<provider_tool>…`), pas en blocs natifs (D118).
+
 ## Arbre
 
 | Méthode | Effet |
@@ -304,7 +329,7 @@ await storage.setup(auto_migrate=False)
 Chaque événement : `{id, session_id, turn_id, type, data, ts}`. Types : `turn_start`,
 `user_message`, `message_start`, `text_delta`, `reasoning_delta`, `tool_call_delta` (opt-in),
 `tool_call`, `message_end`, `tool_result`, `state_changed` (JSON Patch), `ask_user`,
-`child_spawned`, `child_result_applied`, `entry_metadata`, `custom`, `turn_end`. `turn_end.reason` ∈ `completed | awaiting_input | interrupted | error |
+`child_spawned`, `child_result_applied`, `provider_tool_call`, `provider_tool_result`, `entry_metadata`, `custom`, `turn_end`. `turn_end.reason` ∈ `completed | awaiting_input | interrupted | error |
 max_steps | crashed | server_shutdown`. Détails : [PROPOSITION.md §3](PROPOSITION.md).
 
 ## Routes FastAPI

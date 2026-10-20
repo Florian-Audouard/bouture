@@ -181,6 +181,7 @@ class BuildContext[S, D]:
             messages=messages,
             tools=self.tools,
             settings={**self.definition.model_settings, **self.model_settings},
+            provider_tools=list(self.definition.provider_tools),
         )
 
 

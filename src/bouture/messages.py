@@ -37,8 +37,25 @@ class ToolCallBlock(BaseModel):
     args: dict[str, Any]
 
 
+class ProviderToolBlock(BaseModel):
+    """Outil exécuté par le fournisseur pendant l'appel (D116) : trace, jamais exécutée par bouture.
+
+    ``name`` est neutre (``"web_search"``, ``"web_fetch"``) ; ``result`` est un résumé texte
+    (``None`` si le fournisseur n'a rien renvoyé, par exemple sur interruption).
+    """
+
+    type: Literal["provider_tool"] = "provider_tool"
+    id: str
+    name: str
+    args: dict[str, Any]
+    result: str | None = None
+    is_error: bool = False
+
+
 ContentBlock = Annotated[TextBlock | ImageBlock, Field(discriminator="type")]
-AssistantBlock = Annotated[TextBlock | ReasoningBlock | ToolCallBlock, Field(discriminator="type")]
+AssistantBlock = Annotated[
+    TextBlock | ReasoningBlock | ToolCallBlock | ProviderToolBlock, Field(discriminator="type")
+]
 
 
 class Usage(BaseModel):
@@ -76,6 +93,10 @@ class AssistantMessage(BaseModel):
     @property
     def text(self) -> str:
         return "".join(b.text for b in self.content if isinstance(b, TextBlock))
+
+    @property
+    def provider_tools(self) -> list[ProviderToolBlock]:
+        return [b for b in self.content if isinstance(b, ProviderToolBlock)]
 
 
 class ToolResultMessage(BaseModel):

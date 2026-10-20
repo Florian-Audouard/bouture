@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..errors import ModelError
 from ..messages import Usage
 from .base import (
+    PROVIDER_TOOLS,
     Done,
     Estimate,
     ModelEvent,
     ModelRequest,
+    ProviderToolCall,
+    ProviderToolResult,
     TextDelta,
     ToolCallComplete,
     ToolCallDelta,
@@ -29,12 +32,16 @@ class FakeReply:
     - ``text`` est streamé en morceaux de ``chunk`` caractères ;
     - ``tool_calls`` : liste de ``(nom, args)`` ;
     - ``stream_args`` : les arguments des outils sont aussi streamés (``ToolCallDelta``) ;
-    - ``hang`` : après le texte, attend indéfiniment (pour tester stop / crash) ;
+    - ``provider_calls`` : outils fournisseur ``(nom, args, résultat)`` émis après ``text``
+      (résultat ``None`` : pas de résultat), suivis de ``after_text`` (D116) ;
+    - ``hang`` : après le texte (et ``after_text``), attend indéfiniment (pour tester stop / crash) ;
     - ``error`` : lève une ``ModelError`` (``transient`` réessayable) avant tout token.
     """
 
     text: str = ""
     tool_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    provider_calls: list[tuple[str, dict[str, Any], str | None]] = field(default_factory=list)
+    after_text: str = ""
     chunk: int = 4
     stream_args: bool = False
     delay: float = 0.0
@@ -48,9 +55,14 @@ Script = FakeReply | Callable[[ModelRequest], FakeReply]
 
 class FakeModelClient:
     def __init__(
-        self, script: list[Script] | None = None, *, default: FakeReply | None = None
+        self,
+        script: list[Script] | None = None,
+        *,
+        default: FakeReply | None = None,
+        provider_tools: Collection[str] = PROVIDER_TOOLS,
     ) -> None:
         self.script: list[Script] = list(script or [])
+        self.supported = frozenset(provider_tools)
         self.default = default
         self.requests: list[ModelRequest] = []
         self.started = asyncio.Event()
@@ -58,6 +70,9 @@ class FakeModelClient:
 
     def push(self, *replies: Script) -> None:
         self.script.extend(replies)
+
+    def provider_tools(self, model: str) -> frozenset[str]:
+        return self.supported
 
     async def estimate(self, request: ModelRequest) -> Estimate:
         """Grossière : un token pour quatre caractères de prompt."""
@@ -83,6 +98,14 @@ class FakeModelClient:
             else:
                 await asyncio.sleep(0)
             yield TextDelta(reply.text[i : i + reply.chunk])
+        for n, (name, args, result) in enumerate(reply.provider_calls):
+            pid = f"srv_{self._call}_{n}"
+            yield ProviderToolCall(pid, name, args)
+            if result is not None:
+                yield ProviderToolResult(pid, result)
+        for i in range(0, len(reply.after_text), reply.chunk):
+            await asyncio.sleep(0)
+            yield TextDelta(reply.after_text[i : i + reply.chunk])
         if reply.hang:
             await asyncio.Event().wait()
         for n, (name, args) in enumerate(reply.tool_calls):
