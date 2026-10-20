@@ -16,10 +16,10 @@ Limites par rapport à ``LiteLLMClient`` :
 - outils fournisseur (D119) : ``WebSearch`` / ``WebFetch`` du CLI, autorisés par le hook et
   exécutés par Claude Code ; chacun consomme un tour, d'où ``max_turns = 1 +
   provider_tool_turns`` ; ils sont rendus comme ``ProviderToolCall`` / ``ProviderToolResult`` ;
-- signatures de raisonnement non conservées, pas d'``estimate`` ; chaque appel démarre un
-  processus (une à deux secondes de latence).
+- pas d'``estimate`` ; hors tour, ou avec ``persistent=False``, chaque appel démarre un
+  processus (une à deux secondes de latence) et le raisonnement n'est pas conservé.
 
-Mode ``persistent=True`` (D128) : dans un même tour, le processus de Claude Code est gardé entre
+Mode persistant (D128, par défaut depuis D134) : dans un même tour, le processus de Claude Code est gardé entre
 les étapes ; après un appel d'outil, seuls les résultats lui sont envoyés (``tool_result``
 natifs). Historique natif, raisonnement signé conservé, préfixe de prompt stable pour le cache.
 Toute requête qui n'est pas la suite exacte de la précédente repart en transcript.
@@ -118,7 +118,7 @@ class ClaudeCodeClient:
     même appel au modèle quand le kind en demande ; au-delà, Claude Code s'arrête
     (``Done("max_turns")``) avec le texte déjà produit.
 
-    ``persistent`` (D128, désactivé par défaut) : garde le processus entre les étapes d'un même
+    ``persistent`` (D128 ; défaut ``True`` depuis D134, ``False`` = mode transcript) : garde le processus entre les étapes d'un même
     tour (``ClaudeSDKClient``) au lieu de relancer Claude Code avec tout le transcript. Au plus
     ``max_live`` processus gardés ; un processus inutilisé depuis ``live_ttl`` secondes est fermé
     au prochain appel. ``aclose()`` les ferme tous (appelé par ``Agents.shutdown``).
@@ -130,7 +130,7 @@ class ClaudeCodeClient:
         use_subscription: bool = True,
         query: Query | None = None,
         provider_tool_turns: int = 8,
-        persistent: bool = False,
+        persistent: bool = True,
         max_live: int = 4,
         live_ttl: float = 600.0,
         client_factory: ClientFactory | None = None,

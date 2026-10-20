@@ -198,14 +198,23 @@ async def test_without_turn_uses_query() -> None:
     assert events[-1] == Done("end_turn") and seen and not fleet.clients
 
 
-async def test_not_persistent_by_default() -> None:
+async def test_persistent_by_default() -> None:
+    """D134 : sans argument, un appel dans un tour garde son processus."""
+    fleet = _Fleet(_call("t1"))
+    client = ClaudeCodeClient(client_factory=fleet)
+    await _run(client, _request([_user("x")], uuid4()))
+    assert len(fleet.clients) == 1 and not fleet.clients[0].closed
+    await client.aclose()
+
+
+async def test_transcript_mode_when_disabled() -> None:
     fleet = _Fleet()
 
     async def query(*, prompt: str, options: Any) -> AsyncGenerator[Any]:
         for m in _call("t1"):
             yield m
 
-    client = ClaudeCodeClient(client_factory=fleet, query=query)
+    client = ClaudeCodeClient(persistent=False, client_factory=fleet, query=query)
     await _run(client, _request([_user("x")], uuid4()))
     assert not fleet.clients
 
