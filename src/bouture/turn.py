@@ -496,7 +496,6 @@ class TurnExecutor:
             msg, entry_id = await self._call_model(request)
             if not msg.tool_calls:
                 return "completed"
-            self._open_calls = list(msg.tool_calls)
             while self._open_calls:
                 await self._run_tool(self._open_calls[0], entry_id)
             if self.pending:
@@ -683,6 +682,9 @@ class TurnExecutor:
         udump = usage.model_dump(mode="json")
         self.builder.add("assistant", msg.model_dump(mode="json"), entry_id=entry_id, usage=udump)
         self._open_msg = None
+        # Sans await entre l'ajout du message et cette ligne : une interruption ultérieure trouve
+        # ses appels ouverts et leur donne un résultat « Interrompu » (D126).
+        self._open_calls = list(msg.tool_calls)
         self.usage = self.usage + usage
         await self.sink.emit(
             "message_end", {"entry_id": str(entry_id), "interrupted": False, "usage": udump}

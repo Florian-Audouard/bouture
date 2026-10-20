@@ -344,6 +344,50 @@ def include_name(name, type_, parent_names):
 await storage.setup(auto_migrate=False)
 ```
 
+## Hébergement en arrière-plan
+
+Quand l'hôte n'a pas de boucle à prêter (application synchrone, routes FastAPI `def`,
+SQLAlchemy synchrone) ou que sa boucle ne convient pas (`SelectorEventLoop` imposée sous
+Windows, qui ne sait pas lancer de sous-processus), `BackgroundAgents` fait tourner bouture sur
+un thread à lui, avec sa propre boucle (`Proactor` sous Windows) (D123–D125) :
+
+```python
+from bouture.hosting import BackgroundAgents
+
+agents = Agents(storage=SQLiteStorage("studio.db"), model_client=...)
+agents.register(studio)  # avant start()
+bg = BackgroundAgents(agents).start()  # setup() exécuté sur la boucle de bouture
+
+# Depuis du code synchrone (route `def`, thread de l'application)
+s = bg.run_sync(agents.create_session("studio", owner))
+h = bg.run_sync(agents.send_message(s.id, owner, "dessine un chat"))
+for ev in bg.stream_sync(h.events()):
+    print(ev.type)
+
+bg.shutdown()  # tours clos `server_shutdown`, stockage fermé, thread joint
+```
+
+Depuis une autre boucle, `bg.aio` s'utilise comme `Agents` : chaque appel passe par le pont
+async, les itérateurs et les `TurnHandle` aussi.
+
+```python
+async with BackgroundAgents(agents) as bg:
+    a = bg.aio
+    h = await a.send_message(sid, owner, "encore")
+    async for ev in h.events():
+        ...
+```
+
+- **Ponts** : `submit(coro)` → `concurrent.futures.Future` ; `await bg.run(coro)` ;
+  `bg.run_sync(coro, timeout=...)` (au-delà : `TimeoutError`, l'appel est annulé) ;
+  `bg.stream(it)` / `bg.stream_sync(it)`. Fermer l'itérateur côté hôte (`break`, client SSE
+  déconnecté) arrête la lecture côté bouture.
+- **Dans un outil** (donc sur la boucle de bouture) : `run` / `stream` sont un simple `await` ;
+  `run_sync` / `stream_sync` lèvent `RuntimeError` plutôt que de bloquer la boucle.
+- **FastAPI** : `make_router(bg, current_user)` accepte directement un `BackgroundAgents`.
+- **Arrêt** : `shutdown(timeout)` est idempotent ; gestionnaires de contexte `with` et
+  `async with`. Ne pas l'appeler depuis un outil.
+
 ## Événements
 
 Chaque événement : `{id, session_id, turn_id, type, data, ts}`. Types : `turn_start`,

@@ -17,6 +17,7 @@ from bouture import (
     SessionBusy,
     ToolContext,
 )
+from bouture.events import EventSink
 
 from .conftest import AgentsFactory, Note, collect, types
 
@@ -204,6 +205,32 @@ async def test_stop_during_tool_restores_state(agents: Agents[Any], fake: FakeMo
     assert branch[-1].type == "tool_result"
     assert branch[-1].content["is_error"] and branch[-1].content["content"].startswith("Interrompu")
     assert (await agents.get_state(s.id, OWNER)).state.title == ""
+
+
+async def test_cancel_right_after_tool_calls_closes_them(
+    agents: Agents[Any], fake: FakeModelClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interruption pendant ``message_end`` : le message assistant est enregistré, ses appels
+    reçoivent quand même « Interrompu » (D126)."""
+    emit = EventSink.emit
+
+    async def cancelling_emit(self: EventSink, type: str, data: dict[str, Any]) -> None:
+        await emit(self, type, data)
+        if type == "message_end" and not data["interrupted"]:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(EventSink, "emit", cancelling_emit)
+    fake.push(FakeReply("", tool_calls=[("set_title", {"title": "T"})]))
+    s = await agents.create_session("note", OWNER)
+    end = await (await agents.send_message(s.id, OWNER, "x")).wait()
+    assert end.data["reason"] != "completed"
+    branch = await agents.get_branch(s.id, OWNER)
+    assert [e.type for e in branch][-2:] == ["assistant", "tool_result"]
+    assert branch[-1].content["content"].startswith("Interrompu")
+    assert (await agents.get_session(s.id, OWNER)).status == "idle"
 
 
 async def test_disconnect_does_not_stop(agents: Agents[Any], fake: FakeModelClient) -> None:

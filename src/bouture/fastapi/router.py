@@ -23,6 +23,7 @@ from ..errors import (
     StateValidationError,
     UnknownKind,
 )
+from ..hosting import BackgroundAgents
 from ..refs import Data, Ref
 from ..views import (
     EntryView,
@@ -181,12 +182,18 @@ def turn_response(h: TurnHandle) -> StreamingResponse:
 
 # -- routeur -----------------------------------------------------------------------------
 def make_router(
-    agents: Agents[Any], current_user: CurrentUser, *, expose_prompt: bool = True
+    agents: Agents[Any] | BackgroundAgents[Any],
+    current_user: CurrentUser,
+    *,
+    expose_prompt: bool = True,
 ) -> APIRouter:
     """Routeur prêt à monter. ``current_user`` est une dépendance FastAPI renvoyant l'owner.
 
     ``expose_prompt=False`` : ``/preview`` ne renvoie que modèle, réglages et estimation (D93).
+    Avec un ``BackgroundAgents``, chaque route passe par son pont async (D124).
     """
+    if isinstance(agents, BackgroundAgents):
+        agents = agents.aio
     r = APIRouter(responses={404: {"description": "Introuvable"}, 409: {"description": "Conflit"}})
     User = Depends(current_user)
 
