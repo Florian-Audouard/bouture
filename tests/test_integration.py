@@ -364,6 +364,41 @@ async def test_list_sessions_by_object_and_metadata(agents: Agents[Any]) -> None
     assert (await agents.list_sessions("bob", metadata={"x": 1})).items == []
 
 
+@pytest.mark.parametrize(
+    ("doc", "query", "match"),
+    [
+        ({"a": {"b": {"c": 1}}, "z": 0}, {"a": {"b": {"c": 1}}}, True),
+        ({"a": {"b": {"c": 1}}}, {"a": {"b": {}}}, True),
+        ({"a": {"b": {"c": 1}}}, {"a": {"b": {"c": 2}}}, False),
+        ({"a": {"b": 1}}, {"a": {"b": 1, "c": 2}}, False),
+        ({"tags": ["x", "y", "z"]}, {"tags": ["z", "x"]}, True),
+        ({"tags": ["x", "y"]}, {"tags": ["x", "x"]}, True),
+        ({"tags": ["x", "y"]}, {"tags": []}, True),
+        ({"tags": ["x", "y"]}, {"tags": ["w"]}, False),
+        ({"tags": ["x"]}, {"tags": "x"}, False),
+        ({"tags": "x"}, {"tags": ["x"]}, False),
+        ({"l": [{"id": 1, "n": "a"}, {"id": 2}]}, {"l": [{"id": 1}]}, True),
+        ({"l": [[1, 2], [3]]}, {"l": [[2]]}, True),
+        ({"a": None}, {"a": None}, True),
+        ({}, {"a": None}, False),
+        ({"a": 0}, {"a": None}, False),
+        ({"a": True}, {"a": 1}, False),
+        ({"a": 1}, {"a": True}, False),
+        ({"a": False}, {"a": 0}, False),
+        ({"a": 1}, {"a": 1.0}, True),
+        ({"a": "1"}, {"a": 1}, False),
+        ({"a": 1}, {}, True),
+    ],
+)
+async def test_metadata_filter_has_jsonb_containment_semantics(
+    agents: Agents[Any], doc: dict[str, Any], query: dict[str, Any], match: bool
+) -> None:
+    """Même sémantique que ``@>`` de Postgres sur toutes les implémentations (D102, D109)."""
+    s = await agents.create_session("note", OWNER, metadata=doc)
+    found = [x.id for x in (await agents.list_sessions(OWNER, metadata=query)).items]
+    assert found == ([s.id] if match else [])
+
+
 # -- D104 : import d'historique -----------------------------------------------------------
 async def test_import_session(agents: Agents[Any], fake: FakeModelClient) -> None:
     t0 = datetime(2024, 1, 1, tzinfo=UTC)

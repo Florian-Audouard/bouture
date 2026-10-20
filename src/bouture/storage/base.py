@@ -1,7 +1,7 @@
 """Interface de stockage.
 
 Tout passe par une transaction (``Storage.transaction()``) ; les notifications émises dans
-une transaction ne partent qu'au commit. Deux implémentations : mémoire (tests) et Postgres.
+une transaction ne partent qu'au commit. Trois implémentations : mémoire (tests), Postgres et SQLite.
 """
 
 from __future__ import annotations
@@ -134,6 +134,31 @@ class EventRecord:
     type: str
     data: dict[str, Any]
     created_at: datetime
+
+
+def json_contains(doc: Any, sub: Any) -> bool:
+    """Inclusion JSON, sémantique de l'opérateur JSONB ``@>`` de Postgres (D102).
+
+    Objets : chaque clé de ``sub`` existe dans ``doc`` et y est incluse. Listes : chaque élément
+    de ``sub`` est inclus dans au moins un élément de ``doc`` (ordre et doublons ignorés).
+    Scalaires : égalité JSON, où un booléen n'est jamais égal à un nombre. Mémoire et SQLite
+    l'utilisent tel quel, ce qui garantit le même filtre ``metadata`` partout.
+    """
+    if isinstance(sub, dict):
+        if not isinstance(doc, dict):
+            return False
+        d: dict[str, Any] = doc  # pyright: ignore[reportUnknownVariableType]
+        s: dict[str, Any] = sub  # pyright: ignore[reportUnknownVariableType]
+        return all(k in d and json_contains(d[k], v) for k, v in s.items())
+    if isinstance(sub, list):
+        if not isinstance(doc, list):
+            return False
+        dl: list[Any] = doc  # pyright: ignore[reportUnknownVariableType]
+        sl: list[Any] = sub  # pyright: ignore[reportUnknownVariableType]
+        return all(any(json_contains(x, v) for x in dl) for v in sl)
+    if isinstance(doc, bool) or isinstance(sub, bool):
+        return type(doc) is type(sub) and doc == sub
+    return doc == sub
 
 
 class StorageTx(Protocol):

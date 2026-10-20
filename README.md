@@ -2,7 +2,8 @@
 
 Agents LLM pour backends Python async (FastAPI ou autre) dont les sessions sont des **arbres
 versionnés** : fork, rollback, regenerate, clone, stop. Tout est persisté en Postgres (schéma
-`bouture`, créé automatiquement) ; un stockage en mémoire sert aux tests.
+`bouture`, créé automatiquement) ou, pour une application locale, dans un fichier SQLite ; un
+stockage en mémoire sert aux tests.
 
 - Boucle agent maison (LLM → outils → LLM) avec streaming d'événements.
 - État métier typé (Pydantic), versionné à chaque changement, migrable.
@@ -25,7 +26,8 @@ uv add "bouture[litellm,fastapi,asyncpg]"
 ```
 
 Extras : `litellm` (fournisseurs LLM), `claude-code` (abonnement Claude via Claude Code, voir
-plus bas), `fastapi` (routes), `asyncpg` ou `psycopg` (pilote Postgres ; LISTEN/NOTIFY requis).
+plus bas), `fastapi` (routes), `asyncpg` ou `psycopg` (pilote Postgres ; LISTEN/NOTIFY requis),
+`sqlite` (stockage SQLite via `aiosqlite`, voir plus bas).
 
 ## Démarrage rapide
 
@@ -215,6 +217,55 @@ def include_name(name, type_, parent_names):
 await storage.setup(auto_migrate=False)
 ```
 
+## Stockage SQLite
+
+Pour une application locale mono-utilisateur, sous Windows ou Linux, sans serveur de base
+(D107–D111) :
+
+```bash
+uv add "bouture[sqlite]"
+```
+
+```python
+from pathlib import Path
+
+from bouture.storage.sqlite import SQLiteStorage
+
+storage = SQLiteStorage(Path.home() / "Mon Studio" / "bouture.db")  # dossier créé au besoin
+agents = Agents(storage=storage, model_client=...)
+await agents.setup()  # crée / migre les tables `bouture_*`, active le mode WAL
+```
+
+- **Quel fichier ?** Les tables sont préfixées `bouture_`, donc les deux marchent. Un fichier
+  dédié est recommandé : l'application et bouture ne se disputent pas le verrou d'écriture. Le
+  fichier de l'application sert quand `on_publish` / `on_entries` doivent écrire dans vos tables
+  dans la même transaction que bouture (`ctx.db` est lié au fichier de bouture).
+- **Un seul processus par fichier.** Sans LISTEN/NOTIFY, les flux d'événements et le stop sont
+  immédiats dans le processus ; un autre processus ne voit les événements que par sondage
+  (`poll_interval`) et un stop venu d'ailleurs n'est appliqué qu'au battement suivant du bail
+  (`lock_ttl / 3`). Le verrou par bail reste correct : toutes les transactions de bouture sont
+  `BEGIN IMMEDIATE`. Pas de workers multiples sur un même fichier.
+- **Filtre `metadata`** : même sémantique que `@>` en Postgres (clés imbriquées, listes sans
+  ordre, `null`, booléens distincts des nombres).
+- **Migrations avec Alembic**, si le fichier est celui de l'application :
+
+```python
+from bouture.storage.sqlite import apply_migrations
+
+
+def upgrade() -> None:
+    apply_migrations(op.get_bind())  # idempotent ; instructions rejouables
+
+
+# env.py : exclure les tables de bouture de l'autogénération
+def include_name(name, type_, parent_names):
+    return not (type_ == "table" and name.startswith("bouture_"))
+
+
+# démarrage : lecture seule, SchemaOutdated si une révision manque (fichier absent : non créé)
+await storage.setup(auto_migrate=False)
+```
+
 ## Événements
 
 Chaque événement : `{id, session_id, turn_id, type, data, ts}`. Types : `turn_start`,
@@ -303,7 +354,9 @@ L'utilisateur courant est lu dans l'en-tête `X-User`, à remplacer par votre au
 uv run pytest
 ```
 
-Faux LLM (`FakeModelClient`) et stockage mémoire. Pour exécuter aussi chaque test sur Postgres :
+Faux LLM (`FakeModelClient`) ; chaque test de stockage tourne sur la mémoire et sur SQLite
+(fichier temporaire dans un dossier dont le nom contient des espaces). Pour l'exécuter aussi sur
+Postgres :
 
 ```bash
 BOUTURE_TEST_PG_URL=postgresql+asyncpg://postgres:test@localhost:55432/bouture_test uv run pytest
