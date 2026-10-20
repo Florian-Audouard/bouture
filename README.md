@@ -117,6 +117,25 @@ Le tour se termine avec `turn_end{reason: "awaiting_input"}`. `agents.answer(ses
 Pas d'outil intégré : pas de bash, pas d'accès aux fichiers locaux. Options : `@note.tool(name=…,
 timeout=…)`, `ctx.emit(name, data)` (événement `custom`), `ToolFatal` pour arrêter le tour.
 
+### Outils longs
+
+Un outil peut durer bien plus que le bail (`lock_ttl`, 30 s) : un battement indépendant le
+renouvelle tous les `lock_ttl / 3` tant que la boucle asyncio tourne (D122).
+
+```python
+@studio.tool(timeout=None)  # sans limite ; omis = tool_timeout de la définition (120 s)
+async def render(ctx: ToolContext[Studio, Deps], prompt: str) -> str:
+    """Rendu de plusieurs minutes."""
+    return await asyncio.to_thread(ctx.deps.render_blocking, prompt)  # ne bloque pas la boucle
+```
+
+- `AgentDefinition(tool_timeout=None)` : aucun outil du kind n'est limité (D121).
+- **Ne bloquez pas la boucle** : un calcul synchrone appelé directement empêche le battement ;
+  au-delà de `lock_ttl`, le tour peut être déclaré `crashed`. Passez par `asyncio.to_thread` ou
+  un sous-processus.
+- Stop pendant l'outil : il est annulé, état restauré, `tool_result` d'erreur (D27). Crash : le
+  tour est clos `crashed` à l'expiration du bail, au plus `lock_ttl` après le dernier battement.
+
 ## Images
 
 Un outil peut renvoyer du texte et des images ; seules des **références** sont stockées (D45),
