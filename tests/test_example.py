@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
+from bouture import ModelRequest
 from examples.character_world.app import build_agents, create_app
 
 from .conftest import PG_URL
@@ -13,11 +16,13 @@ from .test_routes import parse_sse
 H = {"x-user": "alice"}
 
 
-@pytest.mark.parametrize("backend", ["memory", "postgres"])
-async def test_character_reads_published_world(backend: str) -> None:
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+async def test_character_reads_published_world(backend: str, tmp_path: Path) -> None:
     if backend == "postgres" and not PG_URL:
         pytest.skip("BOUTURE_TEST_PG_URL non défini")
-    agents = build_agents(PG_URL if backend == "postgres" else None)
+    db = tmp_path / "sous dossier" / "monde.db"  # dossier absent, espace dans le chemin
+    urls = {"memory": None, "sqlite": f"sqlite:///{db}", "postgres": PG_URL}
+    agents = build_agents(urls[backend])
     app = create_app(agents)
     transport = httpx.ASGITransport(app=app)
     async with (
@@ -72,6 +77,16 @@ async def test_character_reads_published_world(backend: str) -> None:
         # Bob ne voit pas les publications d'Alice.
         r = await c.get(f"/agents/publications/world/{pub['object_id']}", headers={"x-user": "bob"})
         assert r.json() == []
+
+    if backend == "sqlite":
+        import sqlite3
+
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute(
+                "SELECT version, name FROM app_worlds WHERE id = ? ORDER BY version",
+                (pub["object_id"],),
+            ).fetchall()
+        assert rows == [(1, "Aldéra"), (2, "Aldéra")]
 
     if backend == "postgres":
         from sqlalchemy import text
@@ -151,3 +166,22 @@ def test_client_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     client, model = client_from_env()
     assert isinstance(client, LiteLLMClient) and model == "openai/vendor/some-model"
     assert client.extra == {"api_base": OPENROUTER, "api_key": "sk-test"}
+
+
+def test_studio_integration(tmp_path: Path) -> None:
+    """Exemple d'intégration complète (README) : SQLite, BackgroundAgents, outil image."""
+    from bouture import FakeModelClient, FakeReply
+    from examples.studio import build, run
+
+    seen: list[int] = []
+
+    def check(request: ModelRequest) -> FakeReply:
+        seen.extend(len(i.data) for i in request.images.values())
+        return FakeReply("Voilà.")
+
+    fake = FakeModelClient([FakeReply("", tool_calls=[("render", {"color": "bleu"})]), check])
+    with build(fake, tmp_path / "studio") as bg:
+        state = run(bg, "un carré bleu")
+    assert state.renders == ["render-1.png"]
+    assert seen and seen[0] > 0  # l'image a été chargée pour l'appel suivant
+    assert (tmp_path / "studio" / "bouture.db").exists()
