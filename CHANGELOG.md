@@ -3,14 +3,6 @@
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ; versions
 [SemVer](https://semver.org/lang/fr/). Les numéros Dxx renvoient à [DECISIONS.md](DECISIONS.md).
 
-## [Non publié]
-
-### Modifié
-
-- `ClaudeCodeClient` est persistant par défaut (`persistent=True`) : processus gardé entre
-  les étapes d'un tour, 39 % de latence en moins et 88 % du contexte lu en cache sur le bench
-  (D134, remplace l'opt-in de D128). `persistent=False` rend le mode transcript.
-
 ## [0.2.0] — 2026-10-20
 
 ### Ajouté
@@ -28,7 +20,7 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ; ve
 - **`bouture.hosting.BackgroundAgents`** : bouture sur un thread et une boucle à lui
   (`Proactor` sous Windows), ponts synchrones et async, vue `bg.aio`, `make_router(bg, …)`
   (D123–D125).
-- **`ClaudeCodeClient(persistent=True)`** (opt-in) : processus Claude Code gardé entre les étapes
+- **`ClaudeCodeClient` persistant** : processus Claude Code gardé entre les étapes
   d'un tour, résultats d'outils envoyés en blocs natifs (D128, D130) ;
   `scripts/bench_claude_code.py` mesure latence et cache (D127).
 - `Agents.shutdown()` appelle `model_client.aclose()` s'il existe (D131).
@@ -37,6 +29,9 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ; ve
 
 ### Modifié
 
+- `ClaudeCodeClient` est persistant par défaut (`persistent=True`) : processus gardé entre
+  les étapes d'un tour, 39 % de latence en moins et 88 % du contexte lu en cache sur le bench
+  (D134, remplace l'opt-in de D128). `persistent=False` rend le mode transcript.
 - `@d.tool(timeout=None)` signifie désormais « sans limite » ; omettre `timeout` hérite du délai
   de la définition. Un délai nul ou négatif lève `ValueError` (D121, remplace D65).
 - Les appels d'outils d'un message assistant sont marqués ouverts dès son enregistrement : un
