@@ -156,8 +156,9 @@ Recherche et lecture web exécutées par le fournisseur du modèle ; bouture les
 et les événements sans les exécuter (D116-D120).
 
 ```python
-researcher = AgentDefinition[Notes, Deps]("researcher", model="claude-code/sonnet",
-                                          provider_tools=["web_search", "web_fetch"])
+researcher = AgentDefinition[Notes, Deps](
+    "researcher", model="claude-code/sonnet", provider_tools=["web_search", "web_fetch"]
+)
 ```
 
 - Support par client, vérifié à `register` / `create_session` / `set_model` :
