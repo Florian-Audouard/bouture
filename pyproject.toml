@@ -57,7 +57,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 ignore = ["E501", "ASYNC109"]
 
 [tool.pyright]
-include = ["src", "examples"]
+include = ["src", "examples", "scripts"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false

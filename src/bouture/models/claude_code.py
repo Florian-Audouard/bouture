@@ -18,15 +18,24 @@ Limites par rapport à ``LiteLLMClient`` :
   provider_tool_turns`` ; ils sont rendus comme ``ProviderToolCall`` / ``ProviderToolResult`` ;
 - signatures de raisonnement non conservées, pas d'``estimate`` ; chaque appel démarre un
   processus (une à deux secondes de latence).
+
+Mode ``persistent=True`` (D128) : dans un même tour, le processus de Claude Code est gardé entre
+les étapes ; après un appel d'outil, seuls les résultats lui sont envoyés (``tool_result``
+natifs). Historique natif, raisonnement signé conservé, préfixe de prompt stable pour le cache.
+Toute requête qui n'est pas la suite exacte de la précédente repart en transcript.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import tempfile
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
+from dataclasses import dataclass, field
 from typing import Any, cast
+from uuid import UUID
 
 from ..errors import ModelError
 from ..messages import (
@@ -37,6 +46,7 @@ from ..messages import (
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
+    ToolResultMessage,
     Usage,
     UserMessage,
     message_images,
@@ -82,6 +92,18 @@ qu'assistant au dernier tour uniquement, sans reprendre ces balises. Pour appele
 utilise le mécanisme d'appel d'outils, jamais du texte."""
 
 Query = Callable[..., AsyncIterator[Any]]
+ClientFactory = Callable[[Any], Any]
+
+
+@dataclass
+class _Live:
+    """Processus Claude Code gardé entre deux étapes d'un tour (D128)."""
+
+    client: Any
+    key: str
+    sent: list[Message] = field(default_factory=list[Message])
+    calls: list[str] = field(default_factory=list[str])
+    at: float = 0.0
 
 
 class ClaudeCodeClient:
@@ -95,6 +117,11 @@ class ClaudeCodeClient:
     ``provider_tool_turns`` (D119) : nombre d'appels ``WebSearch`` / ``WebFetch`` permis dans un
     même appel au modèle quand le kind en demande ; au-delà, Claude Code s'arrête
     (``Done("max_turns")``) avec le texte déjà produit.
+
+    ``persistent`` (D128, désactivé par défaut) : garde le processus entre les étapes d'un même
+    tour (``ClaudeSDKClient``) au lieu de relancer Claude Code avec tout le transcript. Au plus
+    ``max_live`` processus gardés ; un processus inutilisé depuis ``live_ttl`` secondes est fermé
+    au prochain appel. ``aclose()`` les ferme tous (appelé par ``Agents.shutdown``).
     """
 
     def __init__(
@@ -103,12 +130,21 @@ class ClaudeCodeClient:
         use_subscription: bool = True,
         query: Query | None = None,
         provider_tool_turns: int = 8,
+        persistent: bool = False,
+        max_live: int = 4,
+        live_ttl: float = 600.0,
+        client_factory: ClientFactory | None = None,
         **options: Any,
     ) -> None:
         self.use_subscription = use_subscription
         self.provider_tool_turns = provider_tool_turns
+        self.persistent = persistent
+        self.max_live = max_live
+        self.live_ttl = live_ttl
         self.options = options
         self._query: Query = query or sdk.query
+        self._client_factory: ClientFactory = client_factory or sdk.ClaudeSDKClient
+        self._live: dict[UUID, _Live] = {}
         # Répertoire vide : Claude Code n'y trouve ni CLAUDE.md ni fichiers du projet.
         self._cwd = tempfile.mkdtemp(prefix="bouture-claude-code-")
 
@@ -145,11 +181,77 @@ class ClaudeCodeClient:
         }
         return sdk.ClaudeAgentOptions(**fields)
 
+    async def aclose(self) -> None:
+        """Ferme les processus gardés (mode ``persistent``)."""
+        live, self._live = list(self._live.values()), {}
+        for lv in live:
+            await _disconnect(lv.client)
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         options = self._options(request)
-        prompt: str | AsyncIterator[dict[str, Any]] = to_transcript(request.messages)
-        if any(b.ref in request.images for b in message_images(request.messages)):
-            prompt = _single(to_transcript_blocks(request.messages, request.images))
+        turn = request.context.turn_id if self.persistent and request.context else None
+        if turn is None:
+            async with aclosing(
+                cast("AsyncGenerator[Any]", self._query(prompt=_prompt(request), options=options))
+            ) as messages:
+                async for ev in self._events(messages, request):
+                    yield ev
+            return
+        await self._sweep()
+        live, prompt = await self._resume(turn, request)
+        if live is None:
+            live = _Live(self._client_factory(options), _key(request))
+            await live.client.connect()
+            prompt = _prompt(request)
+        kept = False
+        try:
+            await live.client.query(prompt)
+            calls: list[str] = []
+            async with aclosing(
+                cast("AsyncGenerator[Any]", live.client.receive_response())
+            ) as messages:
+                async for ev in self._events(messages, request):
+                    if isinstance(ev, ToolCallComplete):
+                        calls.append(ev.id)
+                    elif isinstance(ev, Done) and calls:
+                        # Gardé avant le dernier événement : le lecteur peut s'arrêter à Done.
+                        live.sent, live.calls = list(request.messages), calls
+                        live.at = time.monotonic()
+                        self._live[turn] = live
+                        kept = True
+                        await self._evict()
+                    yield ev
+        finally:
+            if not kept:
+                await _disconnect(live.client)
+
+    async def _resume(
+        self, turn: UUID, request: ModelRequest
+    ) -> tuple[_Live | None, str | AsyncIterator[dict[str, Any]]]:
+        live = self._live.pop(turn, None)
+        if live is None:
+            return None, ""
+        content = _continuation(live, request) if live.key == _key(request) else None
+        if content is None:
+            await _disconnect(live.client)
+            return None, ""
+        return live, _single(content)
+
+    async def _sweep(self) -> None:
+        limit = time.monotonic() - self.live_ttl
+        for turn, lv in list(self._live.items()):
+            if lv.at < limit:
+                del self._live[turn]
+                await _disconnect(lv.client)
+
+    async def _evict(self) -> None:
+        while len(self._live) > self.max_live:
+            oldest = next(iter(self._live))
+            await _disconnect(self._live.pop(oldest).client)
+
+    async def _events(
+        self, messages: AsyncIterator[Any], request: ModelRequest
+    ) -> AsyncIterator[ModelEvent]:
         usage = Usage(model=request.model)
         blocks: dict[int, dict[str, Any]] = {}
         calls: dict[str, ToolCallComplete] = {}
@@ -157,57 +259,54 @@ class ClaudeCodeClient:
         meter = {"base": 0}
         stop: str | None = None
         try:
-            async with aclosing(
-                cast("AsyncGenerator[Any]", self._query(prompt=prompt, options=options))
-            ) as messages:
-                async for msg in messages:
-                    if getattr(msg, "parent_tool_use_id", None):
-                        continue
-                    if isinstance(msg, sdk.StreamEvent):
-                        for ev in _stream_event(msg.event, blocks, usage, meter):
-                            yield ev
-                    elif isinstance(msg, sdk.AssistantMessage):
-                        if msg.error:
-                            raise ModelError(
-                                f"Claude Code : {msg.error}",
-                                transient=msg.error in _TRANSIENT,
-                                code=str(msg.error),
+            async for msg in messages:
+                if getattr(msg, "parent_tool_use_id", None):
+                    continue
+                if isinstance(msg, sdk.StreamEvent):
+                    for ev in _stream_event(msg.event, blocks, usage, meter):
+                        yield ev
+                elif isinstance(msg, sdk.AssistantMessage):
+                    if msg.error:
+                        raise ModelError(
+                            f"Claude Code : {msg.error}",
+                            transient=msg.error in _TRANSIENT,
+                            code=str(msg.error),
+                        )
+                    for b in msg.content:
+                        if isinstance(b, sdk.ToolUseBlock) and b.name in _NEUTRAL:
+                            if b.id not in provided:
+                                provided.add(b.id)
+                                yield ProviderToolCall(b.id, _NEUTRAL[b.name], b.input)
+                        elif isinstance(b, sdk.ServerToolUseBlock):
+                            if b.name in CLI_TOOLS and b.id not in provided:
+                                provided.add(b.id)
+                                yield ProviderToolCall(b.id, b.name, b.input)
+                        elif isinstance(b, sdk.ServerToolResultBlock):
+                            if b.tool_use_id in provided:
+                                text = json.dumps(b.content, ensure_ascii=False)
+                                yield ProviderToolResult(b.tool_use_id, clip_result(text))
+                        elif isinstance(b, sdk.ToolUseBlock):
+                            calls[b.id] = ToolCallComplete(b.id, _strip(b.name), b.input)
+                elif isinstance(msg, sdk.UserMessage) and not isinstance(msg.content, str):
+                    for b in msg.content:
+                        if isinstance(b, sdk.ToolResultBlock) and b.tool_use_id in provided:
+                            yield ProviderToolResult(
+                                b.tool_use_id, _result_text(b.content), bool(b.is_error)
                             )
-                        for b in msg.content:
-                            if isinstance(b, sdk.ToolUseBlock) and b.name in _NEUTRAL:
-                                if b.id not in provided:
-                                    provided.add(b.id)
-                                    yield ProviderToolCall(b.id, _NEUTRAL[b.name], b.input)
-                            elif isinstance(b, sdk.ServerToolUseBlock):
-                                if b.name in CLI_TOOLS and b.id not in provided:
-                                    provided.add(b.id)
-                                    yield ProviderToolCall(b.id, b.name, b.input)
-                            elif isinstance(b, sdk.ServerToolResultBlock):
-                                if b.tool_use_id in provided:
-                                    text = json.dumps(b.content, ensure_ascii=False)
-                                    yield ProviderToolResult(b.tool_use_id, clip_result(text))
-                            elif isinstance(b, sdk.ToolUseBlock):
-                                calls[b.id] = ToolCallComplete(b.id, _strip(b.name), b.input)
-                    elif isinstance(msg, sdk.UserMessage) and not isinstance(msg.content, str):
-                        for b in msg.content:
-                            if isinstance(b, sdk.ToolResultBlock) and b.tool_use_id in provided:
-                                yield ProviderToolResult(
-                                    b.tool_use_id, _result_text(b.content), bool(b.is_error)
-                                )
-                    elif isinstance(msg, sdk.ResultMessage):
-                        stop = msg.stop_reason
-                        if msg.deferred_tool_use is not None:
-                            d = msg.deferred_tool_use
-                            calls.setdefault(d.id, ToolCallComplete(d.id, _strip(d.name), d.input))
-                        elif msg.subtype == "error_max_turns" and request.provider_tools:
-                            stop = "max_turns"  # budget d'outils fournisseur épuisé (D119)
-                        elif msg.is_error and not calls:
-                            raise ModelError(
-                                f"Claude Code : {msg.subtype}",
-                                transient=msg.api_error_status in (429, 500, 502, 503, 529),
-                                code=msg.subtype,
-                            )
-                        break
+                elif isinstance(msg, sdk.ResultMessage):
+                    stop = msg.stop_reason
+                    if msg.deferred_tool_use is not None:
+                        d = msg.deferred_tool_use
+                        calls.setdefault(d.id, ToolCallComplete(d.id, _strip(d.name), d.input))
+                    elif msg.subtype == "error_max_turns" and request.provider_tools:
+                        stop = "max_turns"  # budget d'outils fournisseur épuisé (D119)
+                    elif msg.is_error and not calls:
+                        raise ModelError(
+                            f"Claude Code : {msg.subtype}",
+                            transient=msg.api_error_status in (429, 500, 502, 503, 529),
+                            code=msg.subtype,
+                        )
+                    break
         except ModelError:
             raise
         except sdk.ClaudeSDKError as exc:
@@ -384,3 +483,93 @@ def to_transcript_blocks(
     if text:
         out.append({"type": "text", "text": text})
     return out
+
+
+def _prompt(request: ModelRequest) -> str | AsyncIterator[dict[str, Any]]:
+    """Requête entière en transcript : texte, ou blocs quand une image est chargée."""
+    if any(b.ref in request.images for b in message_images(request.messages)):
+        return _single(to_transcript_blocks(request.messages, request.images))
+    return to_transcript(request.messages)
+
+
+def _key(request: ModelRequest) -> str:
+    """Ce qui doit rester identique pour continuer un processus gardé (D128)."""
+    return json.dumps(
+        [
+            request.model,
+            request.system,
+            [(t.name, t.description, t.parameters) for t in request.tools],
+            request.settings,
+            sorted(request.provider_tools),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _continuation(live: _Live, request: ModelRequest) -> list[dict[str, Any]] | None:
+    """Contenu à envoyer au processus gardé, ou ``None`` si la requête n'en est pas la suite.
+
+    La suite attendue : les messages déjà envoyés (les messages utilisateur de fin, comme
+    ``<etat_courant>``, peuvent être remplacés), la réponse de l'assistant avec exactement les
+    appels différés, leurs résultats, puis d'éventuels messages utilisateur.
+    """
+    sent, cur = live.sent, request.messages
+    p = 0
+    while p < min(len(sent), len(cur)) and sent[p] == cur[p]:
+        p += 1
+    if not all(isinstance(m, UserMessage) for m in sent[p:]) or p >= len(cur):
+        return None
+    reply = cur[p]
+    if not isinstance(reply, AssistantMessage):
+        return None
+    if [b.id for b in reply.content if isinstance(b, ToolCallBlock)] != live.calls:
+        return None
+    results = cur[p + 1 : p + 1 + len(live.calls)]
+    if len(results) != len(live.calls) or not all(
+        isinstance(m, ToolResultMessage) for m in results
+    ):
+        return None
+    done = cast("list[ToolResultMessage]", results)
+    if {m.tool_call_id for m in done} != set(live.calls):
+        return None
+    rest = cur[p + 1 + len(live.calls) :]
+    if not all(isinstance(m, UserMessage) for m in rest):
+        return None
+    out: list[dict[str, Any]] = []
+    for m in done:
+        block: dict[str, Any] = {"type": "tool_result", "tool_use_id": m.tool_call_id}
+        block["content"] = (
+            m.content if isinstance(m.content, str) else _native(m.content, request.images)
+        )
+        if m.is_error:
+            block["is_error"] = True
+        out.append(block)
+    for m in cast("list[UserMessage]", rest):
+        out += _native(m.content, request.images)
+    return out
+
+
+def _native(
+    blocks: Sequence[TextBlock | ImageBlock], images: Mapping[str, LoadedImage]
+) -> list[dict[str, Any]]:
+    """Contenu bouture → blocs de l'API Messages (image chargée en base64, sinon sa référence)."""
+    out: list[dict[str, Any]] = []
+    for b in blocks:
+        if isinstance(b, TextBlock):
+            if b.text:
+                out.append({"type": "text", "text": b.text})
+            continue
+        loaded = images.get(b.ref)
+        if loaded is None:
+            out.append({"type": "text", "text": f"[image : {b.ref}]"})
+        else:
+            source = {"type": "base64", "media_type": loaded.media_type, "data": loaded.base64()}
+            out.append({"type": "image", "source": source})
+    return out
+
+
+async def _disconnect(client: Any) -> None:
+    with contextlib.suppress(Exception):
+        await client.disconnect()

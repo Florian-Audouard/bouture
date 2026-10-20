@@ -292,6 +292,10 @@ class Agents[D]:
         if self._unlisten is not None:
             await self._unlisten()
             self._unlisten = None
+        aclose = getattr(self.model_client, "aclose", None)
+        if aclose is not None:  # processus gardés par le client de modèle (D131)
+            with contextlib.suppress(Exception):
+                await aclose()
         await self.storage.close()
 
     async def _cleanup_loop(self) -> None:

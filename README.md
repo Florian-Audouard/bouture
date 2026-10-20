@@ -466,6 +466,32 @@ secondes de latence par appel. Réservé au développement et à l'usage personn
 d'Anthropic interdisent d'offrir un abonnement claude.ai aux utilisateurs d'un produit ; en
 production, utilisez une clé d'API avec `LiteLLMClient`.
 
+### Coût et latence avec Claude Code
+
+En mode transcript (défaut), chaque étape relance Claude Code avec tout l'historique : seuls le
+prompt système et les outils peuvent être lus en cache, le transcript est réécrit en cache à
+chaque étape (D127, D129).
+
+```python
+ClaudeCodeClient(persistent=True, max_live=4, live_ttl=600.0)
+```
+
+- `persistent=True` (D128, désactivé par défaut) : dans un même tour, le processus est gardé
+  entre les étapes ; après un appel d'outil, seuls les résultats lui sont envoyés. Historique
+  natif, raisonnement conservé dans le tour (D130), préfixe stable pour le cache. Toute requête
+  qui n'est pas la suite exacte de la précédente repart en transcript.
+- Écart : l'état en queue de contexte (D42) d'une étape précédente reste visible du modèle ; le
+  nouvel état suit les résultats d'outils.
+- Au plus `max_live` processus gardés ; `Agents.shutdown()` les ferme (`aclose()`, D131).
+- Mesure : `scripts/bench_claude_code.py` compare les deux modes sur 15 étapes avec outils
+  (latence, tokens d'entrée, `cache_read`, `cache_write`). **Consomme le quota** : rien n'est
+  lancé sans `--run` ; `--fake` fait un essai à blanc.
+
+```bash
+uv run python scripts/bench_claude_code.py --fake --per-turn 5
+uv run python scripts/bench_claude_code.py --run --model haiku --json bench.json
+```
+
 Les variables déjà présentes dans l'environnement priment sur le `.env` (voir
 [examples/llm.py](examples/llm.py)). `DATABASE_URL` active Postgres, sinon le stockage est en mémoire.
 L'utilisateur courant est lu dans l'en-tête `X-User`, à remplacer par votre authentification.
