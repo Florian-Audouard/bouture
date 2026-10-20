@@ -92,7 +92,8 @@ def make_definitions(
                 "VALUES (:id, :version, :owner, :name, :genre, :description)"
             ),
             {
-                "id": ref.object_id,
+                # SQLite ne sait pas lier un UUID : texte ; Postgres le convertit en uuid.
+                "id": str(ref.object_id),
                 "version": ref.version,
                 "owner": ctx.owner,
                 **state.model_dump(exclude={"places"}),
