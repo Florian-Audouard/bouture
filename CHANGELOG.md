@@ -3,6 +3,14 @@
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ; versions
 [SemVer](https://semver.org/lang/fr/). Les numéros Dxx renvoient à [DECISIONS.md](DECISIONS.md).
 
+## [Non publié]
+
+### Modifié
+
+- `ClaudeCodeClient` est persistant par défaut (`persistent=True`) : processus gardé entre
+  les étapes d'un tour, 39 % de latence en moins et 88 % du contexte lu en cache sur le bench
+  (D134, remplace l'opt-in de D128). `persistent=False` rend le mode transcript.
+
 ## [0.2.0] — 2026-10-20
 
 ### Ajouté

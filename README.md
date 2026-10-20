@@ -471,8 +471,8 @@ with BackgroundAgents(agents) as bg:  # setup() sur la boucle de bouture ; shutd
   au modèle (D112).
 - Routes FastAPI `def` ou SQLAlchemy synchrone : mêmes ponts (`run_sync`, `stream_sync`) ;
   `make_router(bg, current_user)` pour des routes prêtes.
-- `ClaudeCodeClient(persistent=True)` réduit la latence et le cache réécrit dans un tour à
-  outils (D128, opt-in).
+- `ClaudeCodeClient` garde son processus entre les étapes d'un tour (D128, par défaut depuis
+  D134) : moins de latence et de cache réécrit dans un tour à outils.
 
 ## Événements
 
@@ -556,20 +556,23 @@ production, utilisez une clé d'API avec `LiteLLMClient`.
 
 ### Coût et latence avec Claude Code
 
-En mode transcript (défaut), chaque étape relance Claude Code avec tout l'historique : seuls le
-prompt système et les outils peuvent être lus en cache, le transcript est réécrit en cache à
-chaque étape (D127, D129).
+En mode transcript (`persistent=False`), chaque étape relance Claude Code avec tout
+l'historique : seuls le prompt système et les outils peuvent être lus en cache, le transcript
+est réécrit en cache à chaque étape (D127, D129).
 
 ```python
-ClaudeCodeClient(persistent=True, max_live=4, live_ttl=600.0)
+ClaudeCodeClient(persistent=True, max_live=4, live_ttl=600.0)  # valeurs par défaut
+ClaudeCodeClient(persistent=False)  # mode transcript
 ```
 
-- `persistent=True` (D128, désactivé par défaut) : dans un même tour, le processus est gardé
+- `persistent=True` (D128, par défaut depuis D134) : dans un même tour, le processus est gardé
   entre les étapes ; après un appel d'outil, seuls les résultats lui sont envoyés. Historique
   natif, raisonnement conservé dans le tour (D130), préfixe stable pour le cache. Toute requête
   qui n'est pas la suite exacte de la précédente repart en transcript.
 - Écart : l'état en queue de contexte (D42) d'une étape précédente reste visible du modèle ; le
   nouvel état suit les résultats d'outils.
+- Mesure (haiku, un tour de 15 étapes avec outil) : 21,1 s contre 34,7 s, 88 % du contexte
+  lu en cache contre 7 %, environ cinq fois moins de tokens d'entrée équivalents (D134).
 - Au plus `max_live` processus gardés ; `Agents.shutdown()` les ferme (`aclose()`, D131).
 - Mesure : `scripts/bench_claude_code.py` compare les deux modes sur 15 étapes avec outils
   (latence, tokens d'entrée, `cache_read`, `cache_write`). **Consomme le quota** : rien n'est
