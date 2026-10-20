@@ -5,21 +5,23 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import aclosing
-from typing import Any
+from typing import Any, Literal
 
 from ..errors import ModelError
 from ..messages import (
-    AssistantMessage,
+    ImageBlock,
     Message,
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
+    ToolResultMessage,
     Usage,
     UserMessage,
 )
 from .base import (
     Done,
     Estimate,
+    LoadedImage,
     ModelEvent,
     ModelRequest,
     ReasoningDelta,
@@ -27,7 +29,10 @@ from .base import (
     ToolCallComplete,
     ToolCallDelta,
     UsageReport,
+    image_url,
 )
+
+ToolImages = Literal["auto", "inline", "user"]
 
 Credentials = Callable[[ModelRequest], Awaitable[Mapping[str, Any]]]
 
@@ -59,6 +64,12 @@ class LiteLLMClient:
     ``request.context`` (owner, session, kind). Les clés renvoyées (``api_key``,
     ``api_base``, ``extra_headers``…) sont passées à LiteLLM pour ce seul appel : rien n'est
     stocké ni journalisé.
+
+    ``tool_images`` (D114) : où placer les images renvoyées par un outil. ``"inline"`` dans le
+    ``tool_result`` (Anthropic l'accepte) ; ``"user"`` dans un message utilisateur qui suit
+    les résultats d'outils (OpenAI n'accepte que du texte dans un message ``tool``) ;
+    ``"auto"`` (défaut) choisit ``"inline"`` pour le fournisseur ``anthropic``, ``"user"``
+    sinon.
     """
 
     def __init__(
@@ -66,18 +77,28 @@ class LiteLLMClient:
         api_keys: dict[str, str] | None = None,
         *,
         credentials: Credentials | None = None,
+        tool_images: ToolImages = "auto",
         **extra: Any,
     ) -> None:
         self.api_keys = api_keys or {}
         self.credentials = credentials
+        self.tool_images: ToolImages = tool_images
         self.extra = extra
+
+    def _messages(self, request: ModelRequest) -> list[dict[str, Any]]:
+        mode = self.tool_images
+        if mode == "auto":
+            mode = "inline" if _provider(request.model) == "anthropic" else "user"
+        return to_openai_messages(
+            request.system, request.messages, images=request.images, tool_images=mode
+        )
 
     def _key(self, model: str) -> str | None:
         return self.api_keys.get(model.split("/", 1)[0])
 
     async def estimate(self, request: ModelRequest) -> Estimate:
         """Tokens d'entrée (tokenizer LiteLLM) et coût d'entrée si le modèle est tarifé (D93)."""
-        messages = to_openai_messages(request.system, request.messages)
+        messages = self._messages(request)
         try:
             tokens = litellm.token_counter(
                 model=request.model,
@@ -98,7 +119,7 @@ class LiteLLMClient:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "messages": to_openai_messages(request.system, request.messages),
+            "messages": self._messages(request),
             "stream": True,
             "stream_options": {"include_usage": True},
             **self.extra,
@@ -204,27 +225,75 @@ def _usage(u: Any, model: str) -> Usage:
     )
 
 
-def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
+def _provider(model: str) -> str | None:
+    try:
+        return litellm.get_llm_provider(model)[1]
+    except Exception:
+        return None
+
+
+def to_openai_messages(
+    system: str,
+    messages: list[Message],
+    *,
+    images: Mapping[str, LoadedImage] | None = None,
+    tool_images: Literal["inline", "user"] = "user",
+) -> list[dict[str, Any]]:
     """Format neutre → format OpenAI (compris par LiteLLM pour tous les fournisseurs).
 
-    Les messages utilisateur consécutifs sont fusionnés.
+    Les messages utilisateur consécutifs sont fusionnés. Une image chargée (``images``) part
+    en URL ``data:`` ; sinon par sa référence. Images de résultats d'outils : voir
+    ``LiteLLMClient.tool_images`` (D114).
     """
+    loaded = images or {}
     out: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []  # images d'outils, mode "user"
+    count = 0
+
+    def add_user(parts: list[dict[str, Any]]) -> None:
+        if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
+            out[-1]["content"].extend(parts)
+        else:
+            out.append({"role": "user", "content": parts})
+
+    def image_part(b: ImageBlock) -> dict[str, Any]:
+        return {"type": "image_url", "image_url": {"url": image_url(b, loaded)}}
+
     if system:
         out.append({"role": "system", "content": system})
     for m in messages:
+        if deferred and not isinstance(m, ToolResultMessage):
+            add_user(deferred)
+            deferred = []
         if isinstance(m, UserMessage):
-            parts: list[dict[str, Any]] = []
-            for b in m.content:
-                if isinstance(b, TextBlock):
-                    parts.append({"type": "text", "text": b.text})
-                else:
-                    parts.append({"type": "image_url", "image_url": {"url": b.ref}})
-            if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
-                out[-1]["content"].extend(parts)
+            add_user(
+                [
+                    {"type": "text", "text": b.text} if isinstance(b, TextBlock) else image_part(b)
+                    for b in m.content
+                ]
+            )
+        elif isinstance(m, ToolResultMessage):
+            if isinstance(m.content, str) or not m.images:
+                out.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": m.text})
+            elif tool_images == "inline":
+                parts = [
+                    {"type": "text", "text": b.text} if isinstance(b, TextBlock) else image_part(b)
+                    for b in m.content
+                ]
+                out.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": parts})
             else:
-                out.append({"role": "user", "content": parts})
-        elif isinstance(m, AssistantMessage):
+                texts: list[str] = []
+                for b in m.content:
+                    if isinstance(b, TextBlock):
+                        texts.append(b.text)
+                        continue
+                    count += 1
+                    texts.append(f"[image {count} : {b.ref}, jointe au message suivant]")
+                    label = f"Image {count} renvoyée par l'outil {m.name} ({m.tool_call_id}) :"
+                    deferred += [{"type": "text", "text": label}, image_part(b)]
+                content = "\n".join(t for t in texts if t)
+                out.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": content})
+        else:
             msg: dict[str, Any] = {"role": "assistant", "content": m.text or None}
             thinking = [
                 {"type": "thinking", "thinking": b.text, "signature": b.signature}
@@ -246,6 +315,6 @@ def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, A
             if msg["content"] is None and not tcs:
                 continue
             out.append(msg)
-        else:
-            out.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": m.content})
+    if deferred:
+        add_user(deferred)
     return out

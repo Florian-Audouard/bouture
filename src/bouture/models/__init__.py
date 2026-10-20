@@ -2,6 +2,7 @@ from .base import (
     CallContext,
     Done,
     Estimate,
+    LoadedImage,
     ModelClient,
     ModelEvent,
     ModelRequest,
@@ -11,6 +12,7 @@ from .base import (
     ToolCallDelta,
     ToolSpec,
     UsageReport,
+    image_url,
 )
 from .fake import FakeModelClient, FakeReply
 
@@ -20,6 +22,7 @@ __all__ = [
     "Estimate",
     "FakeModelClient",
     "FakeReply",
+    "LoadedImage",
     "ModelClient",
     "ModelEvent",
     "ModelRequest",
@@ -29,4 +32,5 @@ __all__ = [
     "ToolCallDelta",
     "ToolSpec",
     "UsageReport",
+    "image_url",
 ]

@@ -90,6 +90,16 @@ class ResolveContext[D]:
 
 
 @dataclass
+class ImageContext[D]:
+    """Reçu par l'``image_loader`` (D113) : pour qui l'image est chargée."""
+
+    deps: D
+    owner: str
+    session_id: UUID
+    kind: str
+
+
+@dataclass
 class TurnEndContext[D]:
     deps: D
     owner: str

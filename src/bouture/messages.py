@@ -5,6 +5,7 @@ Aucun format de fournisseur n'est persisté ; les adaptateurs (``bouture.models`
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, TypeAdapter
@@ -78,11 +79,21 @@ class AssistantMessage(BaseModel):
 
 
 class ToolResultMessage(BaseModel):
+    """``content`` : texte, ou blocs texte / image (D112). Les images restent des références."""
+
     role: Literal["tool"] = "tool"
     tool_call_id: str
     name: str
-    content: str
+    content: str | list[ContentBlock]
     is_error: bool = False
+
+    @property
+    def text(self) -> str:
+        return self.content if isinstance(self.content, str) else content_text(self.content)
+
+    @property
+    def images(self) -> list[ImageBlock]:
+        return [] if isinstance(self.content, str) else images_of(self.content)
 
 
 Message = Annotated[UserMessage | AssistantMessage | ToolResultMessage, Field(discriminator="role")]
@@ -99,5 +110,20 @@ def normalize_content(content: str | list[Any]) -> list[TextBlock | ImageBlock]:
     )
 
 
-def content_text(content: list[TextBlock | ImageBlock]) -> str:
+def content_text(content: Sequence[TextBlock | ImageBlock]) -> str:
     return "".join(b.text for b in content if isinstance(b, TextBlock))
+
+
+def images_of(content: Sequence[TextBlock | ImageBlock]) -> list[ImageBlock]:
+    return [b for b in content if isinstance(b, ImageBlock)]
+
+
+def message_images(messages: Sequence[Message]) -> list[ImageBlock]:
+    """Images d'un historique (messages utilisateur et résultats d'outils), dans l'ordre."""
+    out: list[ImageBlock] = []
+    for m in messages:
+        if isinstance(m, UserMessage):
+            out += images_of(m.content)
+        elif isinstance(m, ToolResultMessage):
+            out += m.images
+    return out

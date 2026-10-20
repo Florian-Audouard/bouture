@@ -8,7 +8,9 @@ utilisateurs d'un produit tiers ; en production, utiliser une clé d'API (``Lite
 Limites par rapport à ``LiteLLMClient`` :
 
 - l'historique est sérialisé en transcript dans un seul message utilisateur (Claude Code
-  n'accepte pas d'historique fabriqué) ; les images n'y figurent que par leur référence ;
+  n'accepte pas d'historique fabriqué) ; les images chargées par l'``image_loader`` y sont
+  insérées en blocs base64 à leur place (entrée streaming, D115), les autres par leur
+  référence ;
 - les outils sont exposés en MCP ; un hook ``PreToolUse`` les « diffère » pour que Claude Code
   s'arrête au premier appel sans l'exécuter : c'est bouture qui exécute les outils ;
 - signatures de raisonnement non conservées, pas d'``estimate`` ; chaque appel démarre un
@@ -19,7 +21,7 @@ from __future__ import annotations
 
 import json
 import tempfile
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from typing import Any, cast
 
@@ -33,9 +35,11 @@ from ..messages import (
     ToolCallBlock,
     Usage,
     UserMessage,
+    message_images,
 )
 from .base import (
     Done,
+    LoadedImage,
     ModelEvent,
     ModelRequest,
     ReasoningDelta,
@@ -121,7 +125,9 @@ class ClaudeCodeClient:
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         options = self._options(request)
-        prompt = to_transcript(request.messages)
+        prompt: str | AsyncIterator[dict[str, Any]] = to_transcript(request.messages)
+        if any(b.ref in request.images for b in message_images(request.messages)):
+            prompt = _single(to_transcript_blocks(request.messages, request.images))
         usage = Usage(model=request.model)
         blocks: dict[int, dict[str, Any]] = {}
         calls: dict[str, ToolCallComplete] = {}
@@ -225,15 +231,35 @@ def _stream_event(
     return []
 
 
-def to_transcript(messages: list[Message]) -> str:
-    """Historique neutre → transcript texte (un seul message utilisateur pour Claude Code)."""
-    parts: list[str] = []
+async def _single(content: list[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
+    """Entrée streaming d'un seul message : seule forme qui accepte des blocs image."""
+    yield {
+        "type": "user",
+        "session_id": "",
+        "parent_tool_use_id": None,
+        "message": {"role": "user", "content": content},
+    }
+
+
+Segment = str | ImageBlock
+
+
+def _body(blocks: Sequence[TextBlock | ImageBlock]) -> list[Segment]:
+    """Texte d'un contenu ; chaque image laisse sa référence lisible, suivie du bloc lui-même."""
+    out: list[Segment] = []
+    for b in blocks:
+        if isinstance(b, TextBlock):
+            out.append(b.text)
+        else:
+            out += [f"[image : {b.ref}]", b]
+    return out
+
+
+def _segments(messages: list[Message]) -> list[Segment]:
+    parts: list[Segment] = ["<transcript>\n"]
     for m in messages:
         if isinstance(m, UserMessage):
-            body = "".join(
-                f"[image : {b.ref}]" if isinstance(b, ImageBlock) else b.text for b in m.content
-            )
-            parts.append(f'<turn role="user">\n{body}\n</turn>')
+            parts += ['<turn role="user">\n', *_body(m.content), "\n</turn>\n"]
         elif isinstance(m, AssistantMessage):
             lines: list[str] = []
             for b in m.content:
@@ -245,11 +271,42 @@ def to_transcript(messages: list[Message]) -> str:
                 elif isinstance(b, ReasoningBlock):
                     continue
             if lines:
-                parts.append('<turn role="assistant">\n' + "\n".join(lines) + "\n</turn>")
+                parts.append('<turn role="assistant">\n' + "\n".join(lines) + "\n</turn>\n")
         else:
             error = ' error="true"' if m.is_error else ""
-            parts.append(
-                f'<tool_result id="{m.tool_call_id}" name="{m.name}"{error}>\n'
-                f"{m.content}\n</tool_result>"
-            )
-    return "<transcript>\n" + "\n".join(parts) + "\n</transcript>"
+            body = [m.content] if isinstance(m.content, str) else _body(m.content)
+            parts += [
+                f'<tool_result id="{m.tool_call_id}" name="{m.name}"{error}>\n',
+                *body,
+                "\n</tool_result>\n",
+            ]
+    parts.append("</transcript>")
+    return parts
+
+
+def to_transcript(messages: list[Message]) -> str:
+    """Historique neutre → transcript texte (un seul message utilisateur pour Claude Code)."""
+    return "".join(p for p in _segments(messages) if isinstance(p, str))
+
+
+def to_transcript_blocks(
+    messages: list[Message], images: Mapping[str, LoadedImage]
+) -> list[dict[str, Any]]:
+    """Transcript en blocs de contenu : texte, et image base64 là où elle a été chargée."""
+    out: list[dict[str, Any]] = []
+    text = ""
+    for p in _segments(messages):
+        if isinstance(p, str):
+            text += p
+            continue
+        loaded = images.get(p.ref)
+        if loaded is None:
+            continue
+        if text:
+            out.append({"type": "text", "text": text})
+            text = ""
+        source = {"type": "base64", "media_type": loaded.media_type, "data": loaded.base64()}
+        out.append({"type": "image", "source": source})
+    if text:
+        out.append({"type": "text", "text": text})
+    return out

@@ -117,6 +117,39 @@ Le tour se termine avec `turn_end{reason: "awaiting_input"}`. `agents.answer(ses
 Pas d'outil intégré : pas de bash, pas d'accès aux fichiers locaux. Options : `@note.tool(name=…,
 timeout=…)`, `ctx.emit(name, data)` (événement `custom`), `ToolFatal` pour arrêter le tour.
 
+## Images
+
+Un outil peut renvoyer du texte et des images ; seules des **références** sont stockées (D45),
+l'hôte fournit les octets au moment de l'appel au modèle (D112, D113).
+
+```python
+from bouture import ImageContext
+from bouture.messages import ImageBlock, TextBlock
+
+
+@studio.tool
+async def render(ctx: ToolContext[Studio, Deps], prompt: str) -> list[TextBlock | ImageBlock]:
+    """Génère une image."""
+    ref = await ctx.deps.generate(prompt)  # ex. "images/42.png"
+    return [TextBlock(text=f"Image {ref} générée."), ImageBlock(ref=ref)]
+
+
+@agents.image_loader
+async def load(ref: str, ctx: ImageContext[Deps]) -> tuple[bytes, str]:
+    return ctx.deps.read_image(ref), "image/png"  # une exception = image indisponible
+```
+
+- Image introuvable au retour de l'outil : le résultat devient une erreur d'outil (état restauré),
+  le tour continue. Introuvable plus tard (supprimée entre deux tours) : le modèle voit
+  `[image indisponible : ref]`, l'arbre garde la référence.
+- Les images envoyées par l'utilisateur (`send_message(..., [TextBlock(…), ImageBlock(ref=…)])`)
+  passent par le même loader. Sans loader, les références partent telles quelles (URL).
+- Événement `tool_result` : `content` (texte) et `blocks` (références) quand le résultat est riche.
+- `LiteLLMClient(tool_images="auto" | "inline" | "user")` : images dans le `tool_result`
+  (Anthropic) ou dans un message utilisateur qui suit (OpenAI) (D114).
+- `ClaudeCodeClient` : les images chargées partent en blocs base64 ; la CLI en écrit une copie
+  temporaire sur le disque (D115).
+
 ## Arbre
 
 | Méthode | Effet |

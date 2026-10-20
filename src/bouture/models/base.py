@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import base64
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import UUID
 
-from ..messages import Message, Usage
+from ..messages import ImageBlock, Message, Usage
 
 
 @dataclass(slots=True)
@@ -27,14 +28,40 @@ class ToolSpec:
     parameters: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class LoadedImage:
+    """Octets d'une image, chargés par l'``image_loader`` de l'hôte pour un seul appel (D113)."""
+
+    data: bytes
+    media_type: str
+
+    def data_url(self) -> str:
+        return f"data:{self.media_type};base64,{self.base64()}"
+
+    def base64(self) -> str:
+        return base64.b64encode(self.data).decode("ascii")
+
+
 @dataclass(slots=True)
 class ModelRequest:
+    """``images`` : octets des ``ImageBlock`` de ``messages``, par ``ref`` (vide sans loader).
+
+    Une image absente de ``images`` est passée au fournisseur par sa référence (URL).
+    """
+
     model: str
     system: str
     messages: list[Message]
     tools: list[ToolSpec] = field(default_factory=list)
     settings: dict[str, Any] = field(default_factory=dict)
     context: CallContext | None = None
+    images: dict[str, LoadedImage] = field(default_factory=dict[str, LoadedImage])
+
+
+def image_url(block: ImageBlock, images: Mapping[str, LoadedImage]) -> str:
+    """URL à transmettre : ``data:`` si l'image a été chargée, sinon la référence telle quelle."""
+    loaded = images.get(block.ref)
+    return loaded.data_url() if loaded is not None else block.ref
 
 
 @dataclass(slots=True)

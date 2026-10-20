@@ -16,7 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ValidationError
 
 from . import jsonpatch
-from .context import InitContext, PurgeContext, ResolveContext, TurnEndContext
+from .context import ImageContext, InitContext, PurgeContext, ResolveContext, TurnEndContext
 from .definition import AgentDefinition
 from .errors import (
     InvalidSettings,
@@ -83,6 +83,7 @@ log = logging.getLogger("bouture")
 
 Resolver = Callable[[Ref | Data, ResolveContext[Any]], Awaitable[str]]
 PurgeHook = Callable[[PurgeContext[Any], str, list[UUID]], Awaitable[None]]
+ImageLoader = Callable[[str, ImageContext[Any]], Awaitable[tuple[bytes, str]]]
 
 
 def _message_content(role: str, content: Any) -> dict[str, Any]:
@@ -190,6 +191,7 @@ class Agents[D]:
         self._resolvers: dict[str, Resolver] = {}
         self._data_types: dict[str, _DataType] = {}
         self._purge_hooks: list[PurgeHook] = []
+        self._image_loader: ImageLoader | None = None
         self._resolve_cache: OrderedDict[tuple[str, UUID, int], str] = OrderedDict()
         self._resolve_cache_size = resolve_cache_size
         self._executors: dict[UUID, TurnExecutor] = {}
@@ -240,6 +242,16 @@ class Agents[D]:
     ) -> None:
         """Déclare le type des inputs ``Data(kind, …)`` (validés, versionnés, migrés)."""
         self._data_types[kind] = _DataType(model, version, migrations or {})
+
+    def image_loader(self, fn: ImageLoader) -> ImageLoader:
+        """Charge une image référencée : ``async (ref, ImageContext) -> (octets, media_type)``.
+
+        Appelé avant chaque appel au modèle pour les images de l'historique (messages
+        utilisateur et résultats d'outils), et dès qu'un outil renvoie une image (D113). Sans
+        loader, les images sont passées au fournisseur par leur référence (URL).
+        """
+        self._image_loader = fn
+        return fn
 
     def on_purge(self, fn: PurgeHook) -> PurgeHook:
         self._purge_hooks.append(fn)
