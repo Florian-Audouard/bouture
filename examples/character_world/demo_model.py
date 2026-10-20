@@ -67,7 +67,7 @@ def decide(request: ModelRequest) -> FakeReply:
     tools = {t.name for t in request.tools}
     for m in reversed(request.messages):
         if isinstance(m, ToolResultMessage):
-            return FakeReply(f"Résultat de {m.name} : {m.content}", delay=0.01)
+            return FakeReply(f"Résultat de {m.name} : {m.text}", delay=0.01)
         if isinstance(m, UserMessage):
             text = _text(m)
             if text.startswith(("<etat_courant>", "[Note système]")):

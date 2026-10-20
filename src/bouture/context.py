@@ -90,6 +90,16 @@ class ResolveContext[D]:
 
 
 @dataclass
+class ImageContext[D]:
+    """Reçu par l'``image_loader`` (D113) : pour qui l'image est chargée."""
+
+    deps: D
+    owner: str
+    session_id: UUID
+    kind: str
+
+
+@dataclass
 class TurnEndContext[D]:
     deps: D
     owner: str
@@ -171,6 +181,7 @@ class BuildContext[S, D]:
             messages=messages,
             tools=self.tools,
             settings={**self.definition.model_settings, **self.model_settings},
+            provider_tools=list(self.definition.provider_tools),
         )
 
 

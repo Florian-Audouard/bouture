@@ -19,15 +19,30 @@ Conception : [PROPOSITION.md](PROPOSITION.md) (API, schéma, événements) et
 
 ## Installation
 
-Python ≥ 3.12.
+Python ≥ 3.12. bouture n'est pas publié sur PyPI : on l'installe depuis le dépôt, à une version
+étiquetée (voir [CHANGELOG.md](CHANGELOG.md)).
 
 ```bash
-uv add "bouture[litellm,fastapi,asyncpg]"
+uv add "bouture[sqlite,claude-code] @ git+https://github.com/Florian-Audouard/bouture@v0.2.0"
 ```
 
-Extras : `litellm` (fournisseurs LLM), `claude-code` (abonnement Claude via Claude Code, voir
-plus bas), `fastapi` (routes), `asyncpg` ou `psycopg` (pilote Postgres ; LISTEN/NOTIFY requis),
-`sqlite` (stockage SQLite via `aiosqlite`, voir plus bas).
+```toml
+# pyproject.toml de l'application
+dependencies = [
+    "bouture[sqlite,claude-code] @ git+https://github.com/Florian-Audouard/bouture@v0.2.0",
+]
+```
+
+| Extra | Apporte | Pour |
+|---|---|---|
+| `sqlite` | `aiosqlite` | stockage SQLite, application locale mono-processus |
+| `litellm` | `litellm` | fournisseurs LLM par clé d'API (`LiteLLMClient`) |
+| `claude-code` | `claude-agent-sdk` | abonnement Claude via Claude Code (`ClaudeCodeClient`), usage personnel |
+| `fastapi` | `fastapi` | routes prêtes à monter (`make_router`) |
+| `asyncpg` | `asyncpg` | pilote Postgres async (LISTEN/NOTIFY) |
+| `psycopg` | `psycopg[binary]` | autre pilote Postgres (LISTEN/NOTIFY) |
+
+Sans extra : cœur, stockage mémoire et faux client de modèle (tests).
 
 ## Démarrage rapide
 
@@ -116,6 +131,84 @@ Le tour se termine avec `turn_end{reason: "awaiting_input"}`. `agents.answer(ses
 
 Pas d'outil intégré : pas de bash, pas d'accès aux fichiers locaux. Options : `@note.tool(name=…,
 timeout=…)`, `ctx.emit(name, data)` (événement `custom`), `ToolFatal` pour arrêter le tour.
+
+### Outils longs
+
+Un outil peut durer bien plus que le bail (`lock_ttl`, 30 s) : un battement indépendant le
+renouvelle tous les `lock_ttl / 3` tant que la boucle asyncio tourne (D122).
+
+```python
+@studio.tool(timeout=None)  # sans limite ; omis = tool_timeout de la définition (120 s)
+async def render(ctx: ToolContext[Studio, Deps], prompt: str) -> str:
+    """Rendu de plusieurs minutes."""
+    return await asyncio.to_thread(ctx.deps.render_blocking, prompt)  # ne bloque pas la boucle
+```
+
+- `AgentDefinition(tool_timeout=None)` : aucun outil du kind n'est limité (D121).
+- **Ne bloquez pas la boucle** : un calcul synchrone appelé directement empêche le battement ;
+  au-delà de `lock_ttl`, le tour peut être déclaré `crashed`. Passez par `asyncio.to_thread` ou
+  un sous-processus.
+- Stop pendant l'outil : il est annulé, état restauré, `tool_result` d'erreur (D27). Crash : le
+  tour est clos `crashed` à l'expiration du bail, au plus `lock_ttl` après le dernier battement.
+
+## Images
+
+Un outil peut renvoyer du texte et des images ; seules des **références** sont stockées (D45),
+l'hôte fournit les octets au moment de l'appel au modèle (D112, D113).
+
+```python
+from bouture import ImageContext
+from bouture.messages import ImageBlock, TextBlock
+
+
+@studio.tool
+async def render(ctx: ToolContext[Studio, Deps], prompt: str) -> list[TextBlock | ImageBlock]:
+    """Génère une image."""
+    ref = await ctx.deps.generate(prompt)  # ex. "images/42.png"
+    return [TextBlock(text=f"Image {ref} générée."), ImageBlock(ref=ref)]
+
+
+@agents.image_loader
+async def load(ref: str, ctx: ImageContext[Deps]) -> tuple[bytes, str]:
+    return ctx.deps.read_image(ref), "image/png"  # une exception = image indisponible
+```
+
+- Image introuvable au retour de l'outil : le résultat devient une erreur d'outil (état restauré),
+  le tour continue. Introuvable plus tard (supprimée entre deux tours) : le modèle voit
+  `[image indisponible : ref]`, l'arbre garde la référence.
+- Les images envoyées par l'utilisateur (`send_message(..., [TextBlock(…), ImageBlock(ref=…)])`)
+  passent par le même loader. Sans loader, les références partent telles quelles (URL).
+- Événement `tool_result` : `content` (texte) et `blocks` (références) quand le résultat est riche.
+- `LiteLLMClient(tool_images="auto" | "inline" | "user")` : images dans le `tool_result`
+  (Anthropic) ou dans un message utilisateur qui suit (OpenAI) (D114).
+- `ClaudeCodeClient` : les images chargées partent en blocs base64 ; la CLI en écrit une copie
+  temporaire sur le disque (D115).
+
+## Outils fournisseur
+
+Recherche et lecture web exécutées par le fournisseur du modèle ; bouture les trace dans l'arbre
+et les événements sans les exécuter (D116-D120).
+
+```python
+researcher = AgentDefinition[Notes, Deps](
+    "researcher", model="claude-code/sonnet", provider_tools=["web_search", "web_fetch"]
+)
+```
+
+- Support par client, vérifié à `register` / `create_session` / `set_model` :
+  `UnsupportedProviderTool` sinon (D117).
+  - `ClaudeCodeClient(provider_tool_turns=8)` : `WebSearch` / `WebFetch` du CLI, au plus
+    `provider_tool_turns` appels par appel au modèle ; au-delà, le tour se termine avec le texte
+    produit (D119).
+  - `LiteLLMClient(provider_tool_options={"web_search": {"max_uses": 3}})` : outils hébergés
+    Anthropic, fournisseur `anthropic` seulement (D120).
+  - `FakeModelClient` : `FakeReply(..., provider_calls=[("web_search", {"query": "q"}, "résultat")],
+    after_text="…")`.
+- Arbre : `ProviderToolBlock(id, name, args, result, is_error)` dans le message assistant
+  (`AssistantMessage.provider_tools`) ; résultat résumé en texte, borné à 20 000 caractères.
+- Événements : `provider_tool_call` `{entry_id, id, name, args}`, puis `provider_tool_result`
+  `{entry_id, id, content, is_error}`. Pas de `tool_result`, pas de pas compté dans `max_steps`.
+- Les tours suivants revoient ces appels en texte (`<provider_tool>…`), pas en blocs natifs (D118).
 
 ## Arbre
 
@@ -266,12 +359,127 @@ def include_name(name, type_, parent_names):
 await storage.setup(auto_migrate=False)
 ```
 
+## Hébergement en arrière-plan
+
+Quand l'hôte n'a pas de boucle à prêter (application synchrone, routes FastAPI `def`,
+SQLAlchemy synchrone) ou que sa boucle ne convient pas (`SelectorEventLoop` imposée sous
+Windows, qui ne sait pas lancer de sous-processus), `BackgroundAgents` fait tourner bouture sur
+un thread à lui, avec sa propre boucle (`Proactor` sous Windows) (D123–D125) :
+
+```python
+from bouture.hosting import BackgroundAgents
+
+agents = Agents(storage=SQLiteStorage("studio.db"), model_client=...)
+agents.register(studio)  # avant start()
+bg = BackgroundAgents(agents).start()  # setup() exécuté sur la boucle de bouture
+
+# Depuis du code synchrone (route `def`, thread de l'application)
+s = bg.run_sync(agents.create_session("studio", owner))
+h = bg.run_sync(agents.send_message(s.id, owner, "dessine un chat"))
+for ev in bg.stream_sync(h.events()):
+    print(ev.type)
+
+bg.shutdown()  # tours clos `server_shutdown`, stockage fermé, thread joint
+```
+
+Depuis une autre boucle, `bg.aio` s'utilise comme `Agents` : chaque appel passe par le pont
+async, les itérateurs et les `TurnHandle` aussi.
+
+```python
+async with BackgroundAgents(agents) as bg:
+    a = bg.aio
+    h = await a.send_message(sid, owner, "encore")
+    async for ev in h.events():
+        ...
+```
+
+- **Ponts** : `submit(coro)` → `concurrent.futures.Future` ; `await bg.run(coro)` ;
+  `bg.run_sync(coro, timeout=...)` (au-delà : `TimeoutError`, l'appel est annulé) ;
+  `bg.stream(it)` / `bg.stream_sync(it)`. Fermer l'itérateur côté hôte (`break`, client SSE
+  déconnecté) arrête la lecture côté bouture.
+- **Dans un outil** (donc sur la boucle de bouture) : `run` / `stream` sont un simple `await` ;
+  `run_sync` / `stream_sync` lèvent `RuntimeError` plutôt que de bloquer la boucle.
+- **FastAPI** : `make_router(bg, current_user)` accepte directement un `BackgroundAgents`.
+- **Arrêt** : `shutdown(timeout)` est idempotent ; gestionnaires de contexte `with` et
+  `async with`. Ne pas l'appeler depuis un outil.
+
+## Intégration complète : SQLite, arrière-plan, Claude Code, images
+
+Application locale synchrone : stockage dans un fichier, bouture sur son propre thread, modèle via
+l'abonnement Claude, et un outil qui renvoie une image. Version complète et exécutable :
+[examples/studio.py](examples/studio.py) (`uv run python -m examples.studio --demo` sans appel
+réel).
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from bouture import AgentDefinition, Agents, ImageContext, ToolContext
+from bouture.hosting import BackgroundAgents
+from bouture.messages import ImageBlock, TextBlock
+from bouture.models.claude_code import ClaudeCodeClient
+from bouture.storage.sqlite import SQLiteStorage
+
+DATA = Path.home() / "Mon Studio"
+
+
+class Studio(BaseModel):
+    renders: list[str] = []
+
+
+@dataclass
+class Deps:
+    images: Path
+
+
+studio = AgentDefinition[Studio, Deps]("studio", model="claude-code/sonnet", state_type=Studio)
+
+
+@studio.tool(timeout=None)  # rendu long : pas de délai (D121)
+async def render(ctx: ToolContext[Studio, Deps], color: str) -> list[TextBlock | ImageBlock]:
+    """Dessine un carré de la couleur demandée et renvoie l'image."""
+    ref = f"render-{len(ctx.state.renders) + 1}.png"
+    (ctx.deps.images / ref).write_bytes(draw_square(color))  # votre moteur de rendu
+    ctx.state.renders.append(ref)
+    return [TextBlock(text=f"Carré {color} rendu : {ref}."), ImageBlock(ref=ref)]
+
+
+agents = Agents[Deps](
+    storage=SQLiteStorage(DATA / "bouture.db"),
+    deps=Deps(DATA / "images"),
+    model_client=ClaudeCodeClient(),
+)
+agents.register(studio)
+
+
+@agents.image_loader
+async def load(ref: str, ctx: ImageContext[Deps]) -> tuple[bytes, str]:
+    return (ctx.deps.images / ref).read_bytes(), "image/png"
+
+
+with BackgroundAgents(agents) as bg:  # setup() sur la boucle de bouture ; shutdown() en sortie
+    s = bg.run_sync(agents.create_session("studio", "moi"))
+    h = bg.run_sync(agents.send_message(s.id, "moi", "dessine un carré rouge"))
+    for ev in bg.stream_sync(h.events()):
+        if ev.type == "text_delta":
+            print(ev.data["text"], end="")
+```
+
+- La base garde la référence `render-1.png`, pas les octets ; le loader les relit à chaque appel
+  au modèle (D112).
+- Routes FastAPI `def` ou SQLAlchemy synchrone : mêmes ponts (`run_sync`, `stream_sync`) ;
+  `make_router(bg, current_user)` pour des routes prêtes.
+- `ClaudeCodeClient` garde son processus entre les étapes d'un tour (D128, par défaut depuis
+  D134) : moins de latence et de cache réécrit dans un tour à outils.
+
 ## Événements
 
 Chaque événement : `{id, session_id, turn_id, type, data, ts}`. Types : `turn_start`,
 `user_message`, `message_start`, `text_delta`, `reasoning_delta`, `tool_call_delta` (opt-in),
 `tool_call`, `message_end`, `tool_result`, `state_changed` (JSON Patch), `ask_user`,
-`child_spawned`, `child_result_applied`, `entry_metadata`, `custom`, `turn_end`. `turn_end.reason` ∈ `completed | awaiting_input | interrupted | error |
+`child_spawned`, `child_result_applied`, `provider_tool_call`, `provider_tool_result`, `entry_metadata`, `custom`, `turn_end`. `turn_end.reason` ∈ `completed | awaiting_input | interrupted | error |
 max_steps | crashed | server_shutdown`. Détails : [PROPOSITION.md §3](PROPOSITION.md).
 
 ## Routes FastAPI
@@ -325,7 +533,9 @@ la racine. Il est ignoré par git et ne doit jamais être commité.
 LLM_API_KEY=sk-or-...                       # https://openrouter.ai/keys
 LLM_MODEL=anthropic/claude-sonnet-4.5       # un modèle qui gère les appels d'outils
 # LLM_BASE_URL=https://openrouter.ai/api/v1  # défaut ; tout autre endpoint compatible OpenAI
+# DATABASE_URL=sqlite:///C:/chemin/monde.db  # défaut : .data/character_world.db
 # DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/db
+# DATABASE_URL=memory                         # rien n'est gardé
 ```
 
 Pour utiliser un abonnement Claude (Pro / Max) au lieu d'une clé d'API, installez l'extra
@@ -344,8 +554,37 @@ secondes de latence par appel. Réservé au développement et à l'usage personn
 d'Anthropic interdisent d'offrir un abonnement claude.ai aux utilisateurs d'un produit ; en
 production, utilisez une clé d'API avec `LiteLLMClient`.
 
+### Coût et latence avec Claude Code
+
+En mode transcript (`persistent=False`), chaque étape relance Claude Code avec tout
+l'historique : seuls le prompt système et les outils peuvent être lus en cache, le transcript
+est réécrit en cache à chaque étape (D127, D129).
+
+```python
+ClaudeCodeClient(persistent=True, max_live=4, live_ttl=600.0)  # valeurs par défaut
+ClaudeCodeClient(persistent=False)  # mode transcript
+```
+
+- `persistent=True` (D128, par défaut depuis D134) : dans un même tour, le processus est gardé
+  entre les étapes ; après un appel d'outil, seuls les résultats lui sont envoyés. Historique
+  natif, raisonnement conservé dans le tour (D130), préfixe stable pour le cache. Toute requête
+  qui n'est pas la suite exacte de la précédente repart en transcript.
+- Écart : l'état en queue de contexte (D42) d'une étape précédente reste visible du modèle ; le
+  nouvel état suit les résultats d'outils.
+- Mesure (haiku, un tour de 15 étapes avec outil) : 21,1 s contre 34,7 s, 88 % du contexte
+  lu en cache contre 7 %, environ cinq fois moins de tokens d'entrée équivalents (D134).
+- Au plus `max_live` processus gardés ; `Agents.shutdown()` les ferme (`aclose()`, D131).
+- Mesure : `scripts/bench_claude_code.py` compare les deux modes sur 15 étapes avec outils
+  (latence, tokens d'entrée, `cache_read`, `cache_write`). **Consomme le quota** : rien n'est
+  lancé sans `--run` ; `--fake` fait un essai à blanc.
+
+```bash
+uv run python scripts/bench_claude_code.py --fake --per-turn 5
+uv run python scripts/bench_claude_code.py --run --model haiku --json bench.json
+```
+
 Les variables déjà présentes dans l'environnement priment sur le `.env` (voir
-[examples/llm.py](examples/llm.py)). `DATABASE_URL` active Postgres, sinon le stockage est en mémoire.
+[examples/llm.py](examples/llm.py)). `examples.character_world` tourne par défaut sur un fichier SQLite (`.data/`, ignoré par git), sans service externe ; `DATABASE_URL` choisit Postgres ou la mémoire.
 L'utilisateur courant est lu dans l'en-tête `X-User`, à remplacer par votre authentification.
 
 ## Tests

@@ -7,31 +7,40 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
 from . import jsonpatch
-from .context import BuildContext, ChildResultContext, EntriesContext, ToolContext
-from .definition import AgentDefinition, AskUser
+from .context import BuildContext, ChildResultContext, EntriesContext, ImageContext, ToolContext
+from .definition import INHERIT, AgentDefinition, AskUser
 from .errors import BoutureError, ModelError, StateValidationError, ToolFatal
 from .events import EventSink, now
 from .ids import uuid7
 from .messages import (
     AssistantMessage,
+    ImageBlock,
+    Message,
+    ProviderToolBlock,
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
     ToolResultMessage,
     Usage,
     UserMessage,
+    content_text,
+    images_of,
+    message_images,
     normalize_content,
 )
 from .models.base import (
     CallContext,
+    LoadedImage,
     ModelEvent,
     ModelRequest,
+    ProviderToolCall,
+    ProviderToolResult,
     ReasoningDelta,
     TextDelta,
     ToolCallComplete,
@@ -49,6 +58,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("bouture")
 
+# Attente du battement du bail ; remplacée par une horloge simulée dans les tests (D122).
+_sleep = asyncio.sleep
+
+_IMAGE_ERROR = "Erreur : image(s) renvoyée(s) par l'outil impossible(s) à charger."
 CANCELLED_QUESTION = "Question annulée : l'utilisateur a poursuivi sans y répondre."
 INTERRUPTED_CALL = "Interrompu : l'outil n'a pas été exécuté jusqu'au bout."
 
@@ -146,10 +159,52 @@ def to_text(result: Any) -> str:
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
-def tool_result_content(call_id: str, name: str, text: str, is_error: bool) -> dict[str, Any]:
+ToolContent = str | list[TextBlock | ImageBlock]
+
+
+def to_result(result: Any) -> ToolContent:
+    """Valeur renvoyée par un outil → contenu du ``tool_result`` (D112).
+
+    Un bloc ou une liste de blocs ``TextBlock`` / ``ImageBlock`` est gardé tel quel ; tout le
+    reste passe par ``to_text`` (une liste de dicts reste du JSON).
+    """
+    if isinstance(result, TextBlock | ImageBlock):
+        return [result]
+    if isinstance(result, list | tuple) and result:
+        items = cast("Sequence[Any]", result)
+        if all(isinstance(b, TextBlock | ImageBlock) for b in items):
+            return list(cast("Sequence[TextBlock | ImageBlock]", items))
+    return to_text(result)
+
+
+def tool_result_content(
+    call_id: str, name: str, content: ToolContent, is_error: bool
+) -> dict[str, Any]:
     return ToolResultMessage(
-        tool_call_id=call_id, name=name, content=text, is_error=is_error
+        tool_call_id=call_id, name=name, content=content, is_error=is_error
     ).model_dump(mode="json")
+
+
+def _dump_blocks(blocks: Sequence[TextBlock | ImageBlock]) -> list[dict[str, Any]]:
+    return [b.model_dump(mode="json") for b in blocks]
+
+
+def _without_images(m: Message, missing: Mapping[str, str]) -> Message:
+    """Remplace, dans la copie envoyée au modèle, les images qui n'ont pas pu être chargées."""
+
+    def swap(blocks: list[TextBlock | ImageBlock]) -> list[TextBlock | ImageBlock]:
+        return [
+            TextBlock(text=f"[image indisponible : {b.ref}]")
+            if isinstance(b, ImageBlock) and b.ref in missing
+            else b
+            for b in blocks
+        ]
+
+    if isinstance(m, UserMessage):
+        return m.model_copy(update={"content": swap(m.content)})
+    if isinstance(m, ToolResultMessage) and not isinstance(m.content, str):
+        return m.model_copy(update={"content": swap(m.content)})
+    return m
 
 
 def revalidate(codec: StateCodec, state: Any) -> BaseModel:
@@ -195,7 +250,17 @@ async def build_request(
         request = bctx.default_request()
     if request.context is None:
         request.context = CallContext(owner, session_id, definition.kind, turn_id)
+    if not request.provider_tools:
+        request.provider_tools = list(definition.provider_tools)
     return request
+
+
+def _set_provider_result(blocks: list[Any], call_id: str, content: str, is_error: bool) -> None:
+    """Range le résultat d'un outil fournisseur dans son bloc (le plus récent de même id)."""
+    for b in reversed(blocks):
+        if isinstance(b, ProviderToolBlock) and b.id == call_id:
+            b.result, b.is_error = content, is_error
+            return
 
 
 async def _aclose(it: AsyncIterator[ModelEvent]) -> None:
@@ -237,6 +302,8 @@ class TurnExecutor:
         self._open_msg: dict[str, Any] | None = None
         self._open_calls: list[ToolCallBlock] = []
         self._tool_before: dict[str, Any] | None = None
+        self._images: dict[str, LoadedImage] = {}
+        self._image_errors: dict[str, str] = {}
 
     # -- annulation ------------------------------------------------------------------
     def cancel(self, reason: str) -> None:
@@ -408,8 +475,11 @@ class TurnExecutor:
         try:
             if tool is not None and tool.answer_fn is not None:
                 result = await tool.answer_fn(ctx, self.answer, q.get("payload"))
-                self.state = ctx.state
-                text = to_text(result)
+                text, is_error = await self._tool_content(result)
+                if is_error:
+                    self._restore(before)
+                else:
+                    self.state = ctx.state
             else:
                 text = f"Réponse de l'utilisateur : {to_text(self.answer)}"
         except (asyncio.CancelledError, ToolFatal):
@@ -422,10 +492,10 @@ class TurnExecutor:
     async def _loop(self) -> str:
         for _ in range(self.definition.max_steps):
             request = await self._build_request()
+            await self._attach_images(request)
             msg, entry_id = await self._call_model(request)
             if not msg.tool_calls:
                 return "completed"
-            self._open_calls = list(msg.tool_calls)
             while self._open_calls:
                 await self._run_tool(self._open_calls[0], entry_id)
             if self.pending:
@@ -453,10 +523,63 @@ class TurnExecutor:
             branch=branch,
         )
 
+    # -- images (D113) ---------------------------------------------------------------
+    async def _load_images(self, blocks: Sequence[ImageBlock]) -> dict[str, str]:
+        """Charge (une fois par tour) les images via l'``image_loader`` ; renvoie les échecs."""
+        loader = self.agents._image_loader  # pyright: ignore[reportPrivateUsage]
+        failed: dict[str, str] = {}
+        if loader is None:
+            return failed
+        ctx = ImageContext[Any](self.agents.deps, self.owner, self.session_id, self.kind)
+        for b in blocks:
+            ref = b.ref
+            if ref in self._images or ref in failed:
+                continue
+            if ref in self._image_errors:
+                failed[ref] = self._image_errors[ref]
+                continue
+            try:
+                data, media_type = await loader(ref, ctx)
+                # Le loader vient de l'hôte : son type déclaré n'est pas une garantie.
+                if not isinstance(cast(object, data), bytes | bytearray) or not media_type:
+                    raise TypeError("l'image_loader doit renvoyer (bytes, media_type)")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failed[ref] = f"{type(e).__name__}: {e}"
+                log.warning("image %r indisponible : %s", ref, failed[ref])
+                continue
+            self._images[ref] = LoadedImage(bytes(data), media_type)
+        self._image_errors.update(failed)
+        return failed
+
+    async def _attach_images(self, request: ModelRequest) -> None:
+        """Joint à la requête les octets des images de l'historique ; les absentes → texte."""
+        blocks = [b for b in message_images(request.messages) if b.ref not in request.images]
+        if not blocks:
+            return
+        failed = await self._load_images(blocks)
+        for b in blocks:
+            if b.ref in self._images:
+                request.images[b.ref] = self._images[b.ref]
+        if failed:
+            request.messages = [_without_images(m, failed) for m in request.messages]
+
+    async def _tool_content(self, result: Any) -> tuple[ToolContent, bool]:
+        """Contenu du résultat et ``is_error`` : une image impossible à charger est une erreur."""
+        content = to_result(result)
+        if isinstance(content, str):
+            return content, False
+        failed = await self._load_images(images_of(content))
+        if failed:
+            lines = [f"- {ref} : {err}" for ref, err in failed.items()]
+            return f"{_IMAGE_ERROR}\n" + "\n".join(lines), True
+        return content, False
+
     # -- appel au modèle -------------------------------------------------------------
     def _append(self, kind: str, text: str, signature: str | None = None) -> None:
         assert self._open_msg is not None
-        blocks: list[TextBlock | ReasoningBlock] = self._open_msg["blocks"]
+        blocks: list[TextBlock | ReasoningBlock | ProviderToolBlock] = self._open_msg["blocks"]
         last = blocks[-1] if blocks else None
         if kind == "text":
             if isinstance(last, TextBlock):
@@ -514,6 +637,33 @@ class TurnExecutor:
                                 "args": ev.args,
                             },
                         )
+                    elif isinstance(ev, ProviderToolCall):
+                        got_token = True
+                        block = ProviderToolBlock(id=ev.id, name=ev.name, args=ev.args)
+                        self._open_msg["blocks"].append(block)
+                        await self.sink.emit(
+                            "provider_tool_call",
+                            {
+                                "entry_id": str(entry_id),
+                                "id": ev.id,
+                                "name": ev.name,
+                                "args": ev.args,
+                            },
+                        )
+                    elif isinstance(ev, ProviderToolResult):
+                        got_token = True
+                        _set_provider_result(
+                            self._open_msg["blocks"], ev.id, ev.content, ev.is_error
+                        )
+                        await self.sink.emit(
+                            "provider_tool_result",
+                            {
+                                "entry_id": str(entry_id),
+                                "id": ev.id,
+                                "content": ev.content,
+                                "is_error": ev.is_error,
+                            },
+                        )
                     elif isinstance(ev, UsageReport):
                         usage = usage + ev.usage
                 break
@@ -532,6 +682,9 @@ class TurnExecutor:
         udump = usage.model_dump(mode="json")
         self.builder.add("assistant", msg.model_dump(mode="json"), entry_id=entry_id, usage=udump)
         self._open_msg = None
+        # Sans await entre l'ajout du message et cette ligne : une interruption ultérieure trouve
+        # ses appels ouverts et leur donne un résultat « Interrompu » (D126).
+        self._open_calls = list(msg.tool_calls)
         self.usage = self.usage + usage
         await self.sink.emit(
             "message_end", {"entry_id": str(entry_id), "interrupted": False, "usage": udump}
@@ -583,7 +736,7 @@ class TurnExecutor:
         before = StateCodec.dump(self.state)
         self._tool_before = before
         ctx = self._tool_ctx(entry_id)
-        timeout = tool.timeout or d.tool_timeout
+        timeout = d.tool_timeout if tool.timeout is INHERIT else tool.timeout
         try:
             result = await asyncio.wait_for(tool.fn(ctx, **kwargs), timeout)
         except (asyncio.CancelledError, ToolFatal):
@@ -598,8 +751,8 @@ class TurnExecutor:
             self._restore(before)
             await self._record_result(call.id, call.name, f"Erreur : {type(e).__name__}: {e}", True)
             return
-        self.state = ctx.state
         if isinstance(result, AskUser):
+            self.state = ctx.state
             patch = self._check_state(before)
             if isinstance(patch, str):
                 # État invalide : la question n'est pas posée, l'erreur revient au LLM.
@@ -619,7 +772,13 @@ class TurnExecutor:
             if patch:
                 await self._emit_state(patch)
             return
-        await self._record_result(call.id, call.name, to_text(result), False)
+        content, is_error = await self._tool_content(result)
+        if is_error:
+            self._restore(before)
+            await self._record_result(call.id, call.name, content, True)
+            return
+        self.state = ctx.state
+        await self._record_result(call.id, call.name, content, False)
 
     def _check_state(self, before: dict[str, Any] | None) -> list[dict[str, Any]] | str:
         """Revalide l'état ; renvoie le patch, ou un message d'erreur si l'état a été annulé."""
@@ -636,13 +795,15 @@ class TurnExecutor:
     async def _emit_state(self, patch: list[dict[str, Any]]) -> None:
         await self.sink.emit("state_changed", {"patch": patch, "state_version": self.codec.version})
 
-    async def _record_result(self, call_id: str, name: str, text: str, is_error: bool) -> None:
+    async def _record_result(
+        self, call_id: str, name: str, content: ToolContent, is_error: bool
+    ) -> None:
         """Valide l'état, ajoute l'entrée ``tool_result`` (sans ``await`` entre les deux)."""
         assert self.builder is not None
         checked = self._check_state(self._tool_before)
         if isinstance(checked, str):
-            text, is_error, checked = checked, True, []
-        e = self.builder.add("tool_result", tool_result_content(call_id, name, text, is_error))
+            content, is_error, checked = checked, True, []
+        e = self.builder.add("tool_result", tool_result_content(call_id, name, content, is_error))
         self._open_calls = [c for c in self._open_calls if c.id != call_id]
         self.pending = [p for p in self.pending if p["tool_call_id"] != call_id]
         self._tool_before = None
@@ -655,7 +816,8 @@ class TurnExecutor:
                 "tool_call_id": call_id,
                 "name": name,
                 "is_error": is_error,
-                "content": text,
+                "content": content if isinstance(content, str) else content_text(content),
+                **({} if isinstance(content, str) else {"blocks": _dump_blocks(content)}),
             },
         )
 
@@ -680,9 +842,14 @@ class TurnExecutor:
             await self._record_result(q["tool_call_id"], q["tool_name"], INTERRUPTED_CALL, True)
 
     async def _heartbeat(self) -> None:
+        """Renouvelle le bail tous les ``lock_ttl / 3``, indépendamment des étapes (D122).
+
+        Tâche à part : un outil qui attend (I/O, ``asyncio.to_thread``, sous-processus) n'empêche
+        pas le renouvellement, quelle que soit sa durée. Un outil qui bloque la boucle, si.
+        """
         a = self.agents
         while True:
-            await asyncio.sleep(a.lock_ttl / 3)
+            await _sleep(a.lock_ttl / 3)
             action = None
             try:
                 async with a.storage.transaction() as tx:
@@ -914,6 +1081,12 @@ async def recover_crashed(agents: Agents[Any], tx: StorageTx, s: SessionRecord) 
                     blocks[-1].text += d["text"]
                 else:
                     blocks.append(cls(text=d["text"]))
+            elif ev.type == "provider_tool_call" and open_msg is not None:
+                open_msg["blocks"].append(
+                    ProviderToolBlock(id=d["id"], name=d["name"], args=d["args"])
+                )
+            elif ev.type == "provider_tool_result" and open_msg is not None:
+                _set_provider_result(open_msg["blocks"], d["id"], d["content"], d["is_error"])
             elif ev.type == "tool_call" and open_msg is not None:
                 open_msg["calls"].append(
                     ToolCallBlock(id=d["tool_call_id"], name=d["name"], args=d["args"])
@@ -937,7 +1110,12 @@ async def recover_crashed(agents: Agents[Any], tx: StorageTx, s: SessionRecord) 
             elif ev.type == "tool_result":
                 b.add(
                     "tool_result",
-                    tool_result_content(d["tool_call_id"], d["name"], d["content"], d["is_error"]),
+                    tool_result_content(
+                        d["tool_call_id"],
+                        d["name"],
+                        normalize_content(d["blocks"]) if "blocks" in d else d["content"],
+                        d["is_error"],
+                    ),
                     entry_id=UUID(d["entry_id"]),
                 )
                 open_calls = [c for c in open_calls if c.id != d["tool_call_id"]]

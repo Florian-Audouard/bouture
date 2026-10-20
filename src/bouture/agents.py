@@ -16,7 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ValidationError
 
 from . import jsonpatch
-from .context import InitContext, PurgeContext, ResolveContext, TurnEndContext
+from .context import ImageContext, InitContext, PurgeContext, ResolveContext, TurnEndContext
 from .definition import AgentDefinition
 from .errors import (
     InvalidSettings,
@@ -26,6 +26,7 @@ from .errors import (
     ResolveError,
     SessionBusy,
     UnknownKind,
+    UnsupportedProviderTool,
 )
 from .events import Hub, now, to_event
 from .ids import uuid7
@@ -33,13 +34,14 @@ from .importing import ImportedEntry, ImportedPublication
 from .messages import (
     AssistantMessage,
     ImageBlock,
+    ProviderToolBlock,
     ReasoningBlock,
     TextBlock,
     ToolCallBlock,
     UserMessage,
     normalize_content,
 )
-from .models.base import Estimate, ModelClient, ModelRequest
+from .models.base import Estimate, ModelClient, ModelRequest, supported_provider_tools
 from .refs import Data, PublishedRef, Ref
 from .runner import InProcessRunner, TurnRunner
 from .state import Migration, StateCodec, migrate
@@ -83,6 +85,7 @@ log = logging.getLogger("bouture")
 
 Resolver = Callable[[Ref | Data, ResolveContext[Any]], Awaitable[str]]
 PurgeHook = Callable[[PurgeContext[Any], str, list[UUID]], Awaitable[None]]
+ImageLoader = Callable[[str, ImageContext[Any]], Awaitable[tuple[bytes, str]]]
 
 
 def _message_content(role: str, content: Any) -> dict[str, Any]:
@@ -107,10 +110,10 @@ def _edited_content(target: EntryRecord, content: Any) -> dict[str, Any]:
         return _message_content("user", content)
     new = AssistantMessage.model_validate(_message_content("assistant", content))
     old = AssistantMessage.model_validate(target.content)
-    reasoning = [b for b in old.content if isinstance(b, ReasoningBlock)]
+    kept = [b for b in old.content if isinstance(b, ReasoningBlock | ProviderToolBlock)]
     calls = [b for b in old.content if isinstance(b, ToolCallBlock)]
     return AssistantMessage(
-        content=[*reasoning, *new.content, *calls], interrupted=old.interrupted
+        content=[*kept, *new.content, *calls], interrupted=old.interrupted
     ).model_dump(mode="json")
 
 
@@ -190,6 +193,7 @@ class Agents[D]:
         self._resolvers: dict[str, Resolver] = {}
         self._data_types: dict[str, _DataType] = {}
         self._purge_hooks: list[PurgeHook] = []
+        self._image_loader: ImageLoader | None = None
         self._resolve_cache: OrderedDict[tuple[str, UUID, int], str] = OrderedDict()
         self._resolve_cache_size = resolve_cache_size
         self._executors: dict[UUID, TurnExecutor] = {}
@@ -203,12 +207,22 @@ class Agents[D]:
         for d in definitions:
             if d.kind in self._defs:
                 raise ValueError(f"kind {d.kind} déjà enregistré")
+            self._check_provider_tools(d, d.model)
             self._defs[d.kind] = d
             self._codecs[d.kind] = StateCodec(
                 d.kind,
                 d.state_type,
                 d.state_version,
                 d.state_migrations,  # type: ignore[arg-type]
+            )
+
+    def _check_provider_tools(self, d: AgentDefinition[Any, Any], model: str) -> None:
+        """Le client sait-il exécuter les outils fournisseur du kind avec ce modèle ? (D117)"""
+        missing = sorted(set(d.provider_tools) - supported_provider_tools(self.model_client, model))
+        if missing:
+            raise UnsupportedProviderTool(
+                f"{type(self.model_client).__name__} ne fournit pas {missing} pour le modèle "
+                f"{model!r} (kind {d.kind})"
             )
 
     def definition(self, kind: str) -> AgentDefinition[Any, D]:
@@ -241,6 +255,16 @@ class Agents[D]:
         """Déclare le type des inputs ``Data(kind, …)`` (validés, versionnés, migrés)."""
         self._data_types[kind] = _DataType(model, version, migrations or {})
 
+    def image_loader(self, fn: ImageLoader) -> ImageLoader:
+        """Charge une image référencée : ``async (ref, ImageContext) -> (octets, media_type)``.
+
+        Appelé avant chaque appel au modèle pour les images de l'historique (messages
+        utilisateur et résultats d'outils), et dès qu'un outil renvoie une image (D113). Sans
+        loader, les images sont passées au fournisseur par leur référence (URL).
+        """
+        self._image_loader = fn
+        return fn
+
     def on_purge(self, fn: PurgeHook) -> PurgeHook:
         self._purge_hooks.append(fn)
         return fn
@@ -268,6 +292,10 @@ class Agents[D]:
         if self._unlisten is not None:
             await self._unlisten()
             self._unlisten = None
+        aclose = getattr(self.model_client, "aclose", None)
+        if aclose is not None:  # processus gardés par le client de modèle (D131)
+            with contextlib.suppress(Exception):
+                await aclose()
         await self.storage.close()
 
     async def _cleanup_loop(self) -> None:
@@ -509,6 +537,8 @@ class Agents[D]:
                 f"inputs attendus pour {kind} : {sorted(d.inputs)} ; reçus : {sorted(inputs)}"
             )
         settings = self._check_settings(d, model_settings or {})
+        if model is not None:
+            self._check_provider_tools(d, model)
         sid = uuid7()
         ts = now()
         async with self.storage.transaction() as tx:
@@ -616,6 +646,10 @@ class Agents[D]:
         return await self._patch_session(session_id, owner, metadata=dict(metadata))
 
     async def set_model(self, session_id: UUID, owner: str, model: str | None) -> SessionInfo:
+        if model is not None:
+            async with self.storage.transaction() as tx:
+                s = await self._session(tx, session_id, owner)
+            self._check_provider_tools(self.definition(s.kind), model)
         return await self._patch_session(session_id, owner, model_override=model)
 
     async def set_model_settings(
@@ -1385,6 +1419,8 @@ class Agents[D]:
                 f"inputs attendus pour {kind} : {sorted(d.inputs)} ; reçus : {sorted(inputs)}"
             )
         settings = self._check_settings(d, model_settings or {})
+        if model is not None:
+            self._check_provider_tools(d, model)
         sid = uuid7()
         start = created_at or min((e.created_at for e in entries), default=now())
         async with self.storage.transaction() as tx:

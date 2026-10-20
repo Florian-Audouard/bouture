@@ -5,6 +5,7 @@ Aucun format de fournisseur n'est persisté ; les adaptateurs (``bouture.models`
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, TypeAdapter
@@ -36,8 +37,25 @@ class ToolCallBlock(BaseModel):
     args: dict[str, Any]
 
 
+class ProviderToolBlock(BaseModel):
+    """Outil exécuté par le fournisseur pendant l'appel (D116) : trace, jamais exécutée par bouture.
+
+    ``name`` est neutre (``"web_search"``, ``"web_fetch"``) ; ``result`` est un résumé texte
+    (``None`` si le fournisseur n'a rien renvoyé, par exemple sur interruption).
+    """
+
+    type: Literal["provider_tool"] = "provider_tool"
+    id: str
+    name: str
+    args: dict[str, Any]
+    result: str | None = None
+    is_error: bool = False
+
+
 ContentBlock = Annotated[TextBlock | ImageBlock, Field(discriminator="type")]
-AssistantBlock = Annotated[TextBlock | ReasoningBlock | ToolCallBlock, Field(discriminator="type")]
+AssistantBlock = Annotated[
+    TextBlock | ReasoningBlock | ToolCallBlock | ProviderToolBlock, Field(discriminator="type")
+]
 
 
 class Usage(BaseModel):
@@ -76,13 +94,27 @@ class AssistantMessage(BaseModel):
     def text(self) -> str:
         return "".join(b.text for b in self.content if isinstance(b, TextBlock))
 
+    @property
+    def provider_tools(self) -> list[ProviderToolBlock]:
+        return [b for b in self.content if isinstance(b, ProviderToolBlock)]
+
 
 class ToolResultMessage(BaseModel):
+    """``content`` : texte, ou blocs texte / image (D112). Les images restent des références."""
+
     role: Literal["tool"] = "tool"
     tool_call_id: str
     name: str
-    content: str
+    content: str | list[ContentBlock]
     is_error: bool = False
+
+    @property
+    def text(self) -> str:
+        return self.content if isinstance(self.content, str) else content_text(self.content)
+
+    @property
+    def images(self) -> list[ImageBlock]:
+        return [] if isinstance(self.content, str) else images_of(self.content)
 
 
 Message = Annotated[UserMessage | AssistantMessage | ToolResultMessage, Field(discriminator="role")]
@@ -99,5 +131,20 @@ def normalize_content(content: str | list[Any]) -> list[TextBlock | ImageBlock]:
     )
 
 
-def content_text(content: list[TextBlock | ImageBlock]) -> str:
+def content_text(content: Sequence[TextBlock | ImageBlock]) -> str:
     return "".join(b.text for b in content if isinstance(b, TextBlock))
+
+
+def images_of(content: Sequence[TextBlock | ImageBlock]) -> list[ImageBlock]:
+    return [b for b in content if isinstance(b, ImageBlock)]
+
+
+def message_images(messages: Sequence[Message]) -> list[ImageBlock]:
+    """Images d'un historique (messages utilisateur et résultats d'outils), dans l'ordre."""
+    out: list[ImageBlock] = []
+    for m in messages:
+        if isinstance(m, UserMessage):
+            out += images_of(m.content)
+        elif isinstance(m, ToolResultMessage):
+            out += m.images
+    return out

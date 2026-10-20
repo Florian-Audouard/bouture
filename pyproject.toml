@@ -1,6 +1,6 @@
 [project]
 name = "bouture"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agents LLM à sessions versionnées (fork, rollback) persistées en Postgres ou SQLite."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -57,7 +57,7 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 ignore = ["E501", "ASYNC109"]
 
 [tool.pyright]
-include = ["src", "examples"]
+include = ["src", "examples", "scripts"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
