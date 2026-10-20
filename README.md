@@ -19,15 +19,30 @@ Conception : [PROPOSITION.md](PROPOSITION.md) (API, schéma, événements) et
 
 ## Installation
 
-Python ≥ 3.12.
+Python ≥ 3.12. bouture n'est pas publié sur PyPI : on l'installe depuis le dépôt, à une version
+étiquetée (voir [CHANGELOG.md](CHANGELOG.md)).
 
 ```bash
-uv add "bouture[litellm,fastapi,asyncpg]"
+uv add "bouture[sqlite,claude-code] @ git+https://github.com/Florian-Audouard/bouture@v0.2.0"
 ```
 
-Extras : `litellm` (fournisseurs LLM), `claude-code` (abonnement Claude via Claude Code, voir
-plus bas), `fastapi` (routes), `asyncpg` ou `psycopg` (pilote Postgres ; LISTEN/NOTIFY requis),
-`sqlite` (stockage SQLite via `aiosqlite`, voir plus bas).
+```toml
+# pyproject.toml de l'application
+dependencies = [
+    "bouture[sqlite,claude-code] @ git+https://github.com/Florian-Audouard/bouture@v0.2.0",
+]
+```
+
+| Extra | Apporte | Pour |
+|---|---|---|
+| `sqlite` | `aiosqlite` | stockage SQLite, application locale mono-processus |
+| `litellm` | `litellm` | fournisseurs LLM par clé d'API (`LiteLLMClient`) |
+| `claude-code` | `claude-agent-sdk` | abonnement Claude via Claude Code (`ClaudeCodeClient`), usage personnel |
+| `fastapi` | `fastapi` | routes prêtes à monter (`make_router`) |
+| `asyncpg` | `asyncpg` | pilote Postgres async (LISTEN/NOTIFY) |
+| `psycopg` | `psycopg[binary]` | autre pilote Postgres (LISTEN/NOTIFY) |
+
+Sans extra : cœur, stockage mémoire et faux client de modèle (tests).
 
 ## Démarrage rapide
 
@@ -388,6 +403,77 @@ async with BackgroundAgents(agents) as bg:
 - **Arrêt** : `shutdown(timeout)` est idempotent ; gestionnaires de contexte `with` et
   `async with`. Ne pas l'appeler depuis un outil.
 
+## Intégration complète : SQLite, arrière-plan, Claude Code, images
+
+Application locale synchrone : stockage dans un fichier, bouture sur son propre thread, modèle via
+l'abonnement Claude, et un outil qui renvoie une image. Version complète et exécutable :
+[examples/studio.py](examples/studio.py) (`uv run python -m examples.studio --demo` sans appel
+réel).
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from bouture import AgentDefinition, Agents, ImageContext, ToolContext
+from bouture.hosting import BackgroundAgents
+from bouture.messages import ImageBlock, TextBlock
+from bouture.models.claude_code import ClaudeCodeClient
+from bouture.storage.sqlite import SQLiteStorage
+
+DATA = Path.home() / "Mon Studio"
+
+
+class Studio(BaseModel):
+    renders: list[str] = []
+
+
+@dataclass
+class Deps:
+    images: Path
+
+
+studio = AgentDefinition[Studio, Deps]("studio", model="claude-code/sonnet", state_type=Studio)
+
+
+@studio.tool(timeout=None)  # rendu long : pas de délai (D121)
+async def render(ctx: ToolContext[Studio, Deps], color: str) -> list[TextBlock | ImageBlock]:
+    """Dessine un carré de la couleur demandée et renvoie l'image."""
+    ref = f"render-{len(ctx.state.renders) + 1}.png"
+    (ctx.deps.images / ref).write_bytes(draw_square(color))  # votre moteur de rendu
+    ctx.state.renders.append(ref)
+    return [TextBlock(text=f"Carré {color} rendu : {ref}."), ImageBlock(ref=ref)]
+
+
+agents = Agents[Deps](
+    storage=SQLiteStorage(DATA / "bouture.db"),
+    deps=Deps(DATA / "images"),
+    model_client=ClaudeCodeClient(),
+)
+agents.register(studio)
+
+
+@agents.image_loader
+async def load(ref: str, ctx: ImageContext[Deps]) -> tuple[bytes, str]:
+    return (ctx.deps.images / ref).read_bytes(), "image/png"
+
+
+with BackgroundAgents(agents) as bg:  # setup() sur la boucle de bouture ; shutdown() en sortie
+    s = bg.run_sync(agents.create_session("studio", "moi"))
+    h = bg.run_sync(agents.send_message(s.id, "moi", "dessine un carré rouge"))
+    for ev in bg.stream_sync(h.events()):
+        if ev.type == "text_delta":
+            print(ev.data["text"], end="")
+```
+
+- La base garde la référence `render-1.png`, pas les octets ; le loader les relit à chaque appel
+  au modèle (D112).
+- Routes FastAPI `def` ou SQLAlchemy synchrone : mêmes ponts (`run_sync`, `stream_sync`) ;
+  `make_router(bg, current_user)` pour des routes prêtes.
+- `ClaudeCodeClient(persistent=True)` réduit la latence et le cache réécrit dans un tour à
+  outils (D128, opt-in).
+
 ## Événements
 
 Chaque événement : `{id, session_id, turn_id, type, data, ts}`. Types : `turn_start`,
@@ -447,7 +533,9 @@ la racine. Il est ignoré par git et ne doit jamais être commité.
 LLM_API_KEY=sk-or-...                       # https://openrouter.ai/keys
 LLM_MODEL=anthropic/claude-sonnet-4.5       # un modèle qui gère les appels d'outils
 # LLM_BASE_URL=https://openrouter.ai/api/v1  # défaut ; tout autre endpoint compatible OpenAI
+# DATABASE_URL=sqlite:///C:/chemin/monde.db  # défaut : .data/character_world.db
 # DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/db
+# DATABASE_URL=memory                         # rien n'est gardé
 ```
 
 Pour utiliser un abonnement Claude (Pro / Max) au lieu d'une clé d'API, installez l'extra
@@ -493,7 +581,7 @@ uv run python scripts/bench_claude_code.py --run --model haiku --json bench.json
 ```
 
 Les variables déjà présentes dans l'environnement priment sur le `.env` (voir
-[examples/llm.py](examples/llm.py)). `DATABASE_URL` active Postgres, sinon le stockage est en mémoire.
+[examples/llm.py](examples/llm.py)). `examples.character_world` tourne par défaut sur un fichier SQLite (`.data/`, ignoré par git), sans service externe ; `DATABASE_URL` choisit Postgres ou la mémoire.
 L'utilisateur courant est lu dans l'en-tête `X-User`, à remplacer par votre authentification.
 
 ## Tests

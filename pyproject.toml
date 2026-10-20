@@ -1,6 +1,6 @@
 [project]
 name = "bouture"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agents LLM à sessions versionnées (fork, rollback) persistées en Postgres ou SQLite."
 readme = "README.md"
 requires-python = ">=3.12"
